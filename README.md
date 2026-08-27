@@ -3,7 +3,7 @@
 Differentiate [Numba](https://numba.pydata.org/)-compiled Python functions
 with the standalone [Enzyme](https://enzyme.mit.edu/) LLVM plugin.
 
-Developed by Yousof Mardoukhi on behalf of [Qruise GmbH](https://qruise.com).
+Originally developed by Yousof Mardoukhi on behalf of [Qruise GmbH](https://qruise.com).
 
 ## Install
 
@@ -65,5 +65,5 @@ forward- and reverse-mode. Arrays/reductions, `np.linalg`/BLAS, and
 
 ## License
 
-Apache License 2.0, © Qruise GmbH — see [LICENSE](LICENSE) and
+Apache License 2.0 with LLVM Exceptions — see [LICENSE](LICENSE) and
 [NOTICE](NOTICE).
