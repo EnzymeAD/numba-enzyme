@@ -50,7 +50,7 @@ g.jvp((1.0, 2.0), (1.0, 0.0))  # forward-mode JVP
 ### Scope
 * It is still not possible to mark the arguments as active or conastant.
 * The arguments and the return value can be of scalar type only at the moment.
-* Linear algebra e.g. `np.dot`, `np.linalg.norm` etc are not support.
+* Linear algebra e.g. `np.dot`, `np.linalg.norm` etc are not supported.
 
 ## License
 
