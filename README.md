@@ -22,7 +22,6 @@ Arguments of the function must be annotated by the `numba_enzyme.types`. This is
 the function to a Numba `cfunc`. Then use `grad`, `jvp` and pass the inputs. Also you can decorate
 your function `f` with `@differentiable`, and call `f.grad` or `f.jvp` to get the gradient or
 Jacobian-vector product, respectively.
-decorator:
 
 ```python
 import math # import numpy as np
