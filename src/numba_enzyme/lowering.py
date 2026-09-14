@@ -46,7 +46,12 @@ _LLVM_SCALAR_TYPE = {
     nb.types.int64: "i64",
 }
 
-llvm_binding.initialize()
+try:
+    llvm_binding.initialize()
+except RuntimeError:
+    # llvmlite >= 0.45 initialises LLVM on import and raises on an explicit
+    # call, so tolerate its absence rather than pinning the older llvmlite.
+    pass
 
 
 class LoweringError(RuntimeError):

@@ -4,8 +4,8 @@ Locate the required external build tools.
 Resolves the ``clang``/``llvm-link``/``opt`` binaries
 and the standalone Enzyme LLVM pass plugin. Prioritise
 the `_vendor/` directory shipped alongside this module,
-and falls back to the system-installed, ``PATH``-resolved
-tools used during development.
+then the repository-local development toolchain, and finally falls back to
+system-installed, ``PATH``-resolved tools.
 
 See Also
 --------
@@ -30,6 +30,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_PLUGIN_PATH = _REPO_ROOT / "enzyme-build" / "Enzyme" / "LLVMEnzyme-15.so"
 _PLUGIN_PATH_ENV_VAR = "NUMBA_ENZYME_PLUGIN_PATH"
 _VENDOR_DIR = Path(__file__).resolve().parent / "_vendor"
+_DEV_VENDOR_DIR = _REPO_ROOT / ".dev-toolchain" / "wheel" / "numba_enzyme" / "_vendor"
 
 
 class ToolchainError(RuntimeError):
@@ -112,6 +113,31 @@ def _which(name: str) -> Path | None:
     return Path(found) if found else None
 
 
+def _from_vendor_dir(vendor_dir: Path) -> Toolchain | None:
+    """
+    Resolve a toolchain rooted at a wheel-style ``_vendor`` directory.
+
+    Parameters
+    ----------
+    vendor_dir : pathlib.Path
+        Directory containing ``bin/``, ``enzyme/``, and ``crt/``.
+
+    Returns
+    -------
+    Toolchain or None
+        Resolved paths, or `None` if the directory is not populated.
+    """
+    vendored_clang = vendor_dir / "bin" / "clang"
+    if not vendored_clang.is_file():
+        return None
+    return Toolchain(
+        clang=vendored_clang,
+        llvm_link=vendor_dir / "bin" / "llvm-link",
+        opt=vendor_dir / "bin" / "opt",
+        enzyme_plugin=vendor_dir / "enzyme" / "LLVMEnzyme-15.so",
+    )
+
+
 def _resolve_vendored() -> Toolchain | None:
     """
     Resolve tools from the `_vendor/` directory shipped in a wheel.
@@ -132,15 +158,24 @@ def _resolve_vendored() -> Toolchain | None:
     >>> _resolve_vendored() is None  # doctest: +SKIP
     True
     """
-    vendored_clang = _VENDOR_DIR / "bin" / "clang"
-    if not vendored_clang.is_file():
-        return None
-    return Toolchain(
-        clang=vendored_clang,
-        llvm_link=_VENDOR_DIR / "bin" / "llvm-link",
-        opt=_VENDOR_DIR / "bin" / "opt",
-        enzyme_plugin=_VENDOR_DIR / "enzyme" / "LLVMEnzyme-15.so",
-    )
+    return _from_vendor_dir(_VENDOR_DIR)
+
+
+def _resolve_development() -> Toolchain | None:
+    """
+    Resolve the repository-local bootstrapped development toolchain.
+
+    Returns
+    -------
+    Toolchain or None
+        Paths under ``.dev-toolchain``, or `None` before bootstrapping.
+
+    See Also
+    --------
+    _resolve_vendored : The installed-wheel source tried first.
+    _resolve_system : The system fallback tried afterwards.
+    """
+    return _from_vendor_dir(_DEV_VENDOR_DIR)
 
 
 def _resolve_system() -> tuple[Toolchain | None, list[str]]:
@@ -199,13 +234,12 @@ def get_toolchain() -> Toolchain:
     """
     Resolve and validate every build tool.
 
-    Priorities the `_vendor/` directory shipped alongside
-    this module in a built wheel; falls back to
-    ``clang-15``/``llvm-link-15``/``opt-15`` on ``PATH``
-    and the standalone Enzyme LLVM pass plugin at a path
-    relative to the repository root otherwise (configurable
-    via the ``NUMBA_ENZYME_PLUGIN_PATH`` environment variable)
-    The result is cached after the first successful call.
+    Prioritizes the `_vendor/` directory shipped alongside this module in a
+    built wheel, then the repository's bootstrapped ``.dev-toolchain``. It
+    finally falls back to ``clang-15``/``llvm-link-15``/``opt-15`` on ``PATH``
+    and the standalone Enzyme plugin relative to the repository root
+    (configurable via ``NUMBA_ENZYME_PLUGIN_PATH``). The result is cached after
+    the first successful call.
 
     Returns
     -------
@@ -234,10 +268,20 @@ def get_toolchain() -> Toolchain:
     """
     toolchain = _resolve_vendored()
     if toolchain is None:
+        toolchain = _resolve_development()
+    if toolchain is None:
         toolchain, missing = _resolve_system()
         if toolchain is None:
+            bootstrap_hint = ""
+            if (_REPO_ROOT / "pyproject.toml").is_file():
+                bootstrap_hint = (
+                    "\nFor an editable checkout, run:\n"
+                    "  uv run python packaging/bootstrap_dev_toolchain.py"
+                )
             raise ToolchainError(
-                "missing required build tool(s):\n  - " + "\n  - ".join(missing)
+                "missing required build tool(s):\n  - "
+                + "\n  - ".join(missing)
+                + bootstrap_hint
             )
 
     for tool in (toolchain.clang, toolchain.llvm_link, toolchain.opt):

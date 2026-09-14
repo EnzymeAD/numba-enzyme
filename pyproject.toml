@@ -9,9 +9,13 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "llvmlite==0.44.0",
-    "numba==0.61.2",
+    # The CPU driver is written against these; the CUDA backend only touches
+    # llvmlite.ir and numba's version string, so newer releases work there and
+    # the exact pins would otherwise force a downgrade on any CUDA consumer.
+    "llvmlite>=0.44",
+    "numba>=0.61",
 ]
+
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -24,6 +28,11 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
     "Topic :: Software Development :: Compilers",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "numba-cuda-mlir>=0.5.1,<0.6",
 ]
 
 [project.urls]
@@ -81,6 +90,7 @@ exclude = [
 
 [dependency-groups]
 dev = [
+    "numba-cuda-mlir[cu12]>=0.5.1,<0.6",
     "numpydoc>=1.10.0",
     "pre-commit>=4.6.1",
     "pytest>=9.1.1",

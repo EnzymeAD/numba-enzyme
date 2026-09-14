@@ -1,4 +1,5 @@
 .venv/
+.dev-toolchain/
 __pycache__/
 *.pyc
 enzyme-src/

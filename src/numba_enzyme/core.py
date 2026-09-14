@@ -4,7 +4,7 @@ Public API tying lowering, driver synthesis, build, and runtime together.
 Exposes the public gradient, Jacobian, JVP, and VJP transformations and the
 `differentiable` decorator.
 
-A function annotated with `numba_enzyme.types` is compiled when it is
+A CPU function annotated with `numba_enzyme.types` is compiled when it is
 transformed. Without annotations, it is instead specialized from the argument
 types of each call to the returned callable, as a Numba ``njit`` function is.
 
@@ -34,29 +34,86 @@ from numba_enzyme.lowering import is_annotated
 from numba_enzyme.runtime import lazy_derivative, load
 
 
-def grad(func: Callable) -> Callable:
+def _differentiate(func, mode, signature, cc):
+    """
+    Return one derivative callable for a CPU or CUDA function.
+
+    Parameters
+    ----------
+    func : callable
+        Annotated CPU function or CUDA device dispatcher to differentiate.
+    mode : str
+        Name of the derivative, such as ``"grad"`` or ``"jacfwd_column"``.
+    signature : object or None
+        Concrete CUDA specialization, or `None`.
+    cc : tuple of int or None
+        CUDA compute capability, or `None`.
+
+    Returns
+    -------
+    callable
+        The requested host or CUDA device callable.
+
+    Raises
+    ------
+    TypeError
+        If CUDA-only options are passed for a CPU function, or `grad` is asked
+        for a vector result.
+
+    See Also
+    --------
+    numba_enzyme.cuda.lazy_cuda_derivative : Builds CUDA derivatives lazily.
+    """
+    from numba_enzyme.cuda import is_cuda_device_function, lazy_cuda_derivative
+
+    if is_cuda_device_function(func):
+        return lazy_cuda_derivative(func, mode, signature=signature, cc=cc)
+    if signature is not None or cc is not None:
+        raise TypeError("signature and cc are only valid for CUDA device functions")
+    if not is_annotated(func):
+        return lazy_derivative(func, mode)
+    differentiated = load(build(func))
+    if mode == "grad" and differentiated.n_outputs != 1:
+        raise TypeError(
+            "grad requires a scalar-output function; use jacfwd or jvp "
+            "for vector outputs"
+        )
+    return getattr(differentiated, mode)
+
+
+def grad(func: Callable, *, signature=None, cc=None) -> Callable:
     """
     Return a callable, computing the reverse-mode gradient of a function.
 
     Parameters
     ----------
     func : callable
-        A scalar-output Python function. Argument and return types come from
-        `numba_enzyme.types` annotations when it has them all, and are
-        otherwise inferred from each call.
+        A scalar-output Python function or a ``@cuda.jit(device=True)``
+        dispatcher. Argument and return types come from `numba_enzyme.types`
+        annotations when a CPU function has them all, and are otherwise
+        inferred from each call.
+    signature : numba_cuda_mlir.typing.Signature, optional
+        Concrete specialization to differentiate for a CUDA device function.
+        This optionally constrains lazy call-site specialization and is invalid
+        for CPU functions.
+    cc : tuple of int, optional
+        CUDA compute capability as ``(major, minor)``. If omitted, the backend
+        uses the current device's compute capability.
+        This option is invalid for CPU functions.
 
     Returns
     -------
     callable
         Takes the same positional arguments as `func` and returns a
-        `tuple` holding the gradient with respect to each of them.
+        `tuple` holding the gradient with respect to each of them. For CUDA,
+        this is a device callable intended for use inside CUDA-compiled code.
 
     Raises
     ------
     TypeError
-        If `func` has a tuple result. An unannotated function's result is only
-        known once the returned callable is called, so that callable raises
-        instead.
+        If CUDA-only options are passed for a CPU function, or a CPU function
+        has a tuple result. An unannotated function's result is only known
+        once the returned callable is called, so that callable raises instead.
 
     See Also
     --------
@@ -72,18 +129,10 @@ def grad(func: Callable) -> Callable:
     >>> grad(f)(2.0)  # doctest: +SKIP
     (4.0,)
     """
-    if not is_annotated(func):
-        return lazy_derivative(func, "grad")
-    differentiated = load(build(func))
-    if differentiated.n_outputs != 1:
-        raise TypeError(
-            "grad requires a scalar-output function; use jacfwd or jvp "
-            "for vector outputs"
-        )
-    return differentiated.grad
+    return _differentiate(func, "grad", signature, cc)
 
 
-def jvp(func: Callable) -> Callable:
+def jvp(func: Callable, *, signature=None, cc=None) -> Callable:
     """
     Return a callable, computing the forward-mode JVP of a function.
 
@@ -91,15 +140,26 @@ def jvp(func: Callable) -> Callable:
     ----------
     func : callable
         A Python function with scalar parameters and a scalar or fixed
-        homogeneous tuple result. Types are inferred from each call unless it
-        is fully annotated with `numba_enzyme.types`.
+        homogeneous tuple result, or a ``@cuda.jit(device=True)`` dispatcher.
+        Types are inferred from each call unless a CPU function is fully
+        annotated with `numba_enzyme.types`.
+    signature : numba_cuda_mlir.typing.Signature, optional
+        Concrete specialization to differentiate for a CUDA device function.
+        This optionally constrains lazy call-site specialization and is invalid
+        for CPU functions.
+    cc : tuple of int, optional
+        CUDA compute capability as ``(major, minor)``. If omitted, the backend
+        uses the current device's compute capability.
+        This option is invalid for CPU functions.
 
     Returns
     -------
     callable
         Takes a `tuple` of primal values and a `tuple` of tangent
         values (both the same length as `func`'s arguments). It returns one
-        `float` for a scalar output or a tuple for a tuple-valued output.
+        `float` for a scalar CPU output, a tuple for a tuple-valued CPU output,
+        or one scalar for CUDA. The CUDA result is a device callable intended
+        for use inside CUDA-compiled code.
 
     See Also
     --------
@@ -115,18 +175,17 @@ def jvp(func: Callable) -> Callable:
     >>> jvp(f)((2.0,), (1.0,))  # doctest: +SKIP
     4.0
     """
-    if not is_annotated(func):
-        return lazy_derivative(func, "jvp")
-    return load(build(func)).jvp
+    return _differentiate(func, "jvp", signature, cc)
 
 
-def vjp(func: Callable) -> Callable:
+def vjp(func: Callable, *, signature=None, cc=None) -> Callable:
     """
     Return a callable computing a reverse-mode vector-Jacobian product.
 
-    The returned CPU callable takes a tuple of primal inputs and an output
-    cotangent. The cotangent is a scalar when `func` returns a scalar and a
-    tuple matching a tuple-valued result::
+    A CPU or scalar-output CUDA callable takes a tuple of primal inputs and an
+    output cotangent; a tuple-returning CUDA primal uses the array call shape
+    instead. The cotangent is a scalar when `func` returns a scalar
+    and a tuple matching a tuple-valued CPU result::
 
         def f(x: Float64, y: Float64) -> tuple[Float64, Float64]:
             return x * y, x * x + y
@@ -137,25 +196,35 @@ def vjp(func: Callable) -> Callable:
     ----------
     func : callable
         A CPU function returning a scalar or fixed homogeneous
-        tuple.
+        tuple, or a CUDA device dispatcher.
+    signature : numba_cuda_mlir.typing.Signature, optional
+        Concrete CUDA specialization every call site must resolve to. CUDA
+        argument types are otherwise inferred at each call site. Invalid for
+        CPU functions.
+    cc : tuple of int, optional
+        CUDA compute capability. Invalid for CPU functions.
 
     Returns
     -------
     callable
-        A host callable ``(primals, cotangent)`` returning one input
-        cotangent per argument.
+        A host or CUDA device callable computing one input cotangent per
+        argument. Tuple-returning CUDA primals use the array call shape
+        documented in the README.
+
+    Raises
+    ------
+    TypeError
+        If CUDA-only options are passed for a CPU function.
 
     See Also
     --------
     jvp : The forward-mode product.
     jacrev : The complete reverse-mode Jacobian.
     """
-    if not is_annotated(func):
-        return lazy_derivative(func, "vjp")
-    return load(build(func)).vjp
+    return _differentiate(func, "vjp", signature, cc)
 
 
-def jacrev(func: Callable) -> Callable:
+def jacrev(func: Callable, *, signature=None, cc=None) -> Callable:
     """
     Return a callable computing a whole reverse-mode Jacobian.
 
@@ -168,7 +237,13 @@ def jacrev(func: Callable) -> Callable:
     ----------
     func : callable
         A CPU function returning a scalar or fixed homogeneous
-        tuple.
+        tuple, or a CUDA device dispatcher.
+    signature : numba_cuda_mlir.typing.Signature, optional
+        Concrete CUDA specialization every call site must resolve to. CUDA
+        argument types are otherwise inferred at each call site. Invalid for
+        CPU functions.
+    cc : tuple of int, optional
+        CUDA compute capability. Invalid for CPU functions.
 
     Returns
     -------
@@ -176,18 +251,21 @@ def jacrev(func: Callable) -> Callable:
         A host callable ``(*args)`` returning a derivative tuple or Jacobian
         tuple matrix.
 
+    Raises
+    ------
+    TypeError
+        If CUDA-only options are passed for a CPU function.
+
     See Also
     --------
     jacrev_row : One runtime-selected row of the same Jacobian.
     vjp : A reverse-mode product with an arbitrary output cotangent.
     jacfwd : The forward-mode counterpart.
     """
-    if not is_annotated(func):
-        return lazy_derivative(func, "jacrev")
-    return load(build(func)).jacrev
+    return _differentiate(func, "jacrev", signature, cc)
 
 
-def jacrev_row(func: Callable) -> Callable:
+def jacrev_row(func: Callable, *, signature=None, cc=None) -> Callable:
     """
     Return a callable computing one reverse-mode Jacobian row.
 
@@ -198,12 +276,23 @@ def jacrev_row(func: Callable) -> Callable:
     ----------
     func : callable
         A CPU function returning a scalar or fixed homogeneous
-        tuple.
+        tuple, or a CUDA device dispatcher.
+    signature : numba_cuda_mlir.typing.Signature, optional
+        Concrete CUDA specialization every call site must resolve to. CUDA
+        argument types are otherwise inferred at each call site. Invalid for
+        CPU functions.
+    cc : tuple of int, optional
+        CUDA compute capability. Invalid for CPU functions.
 
     Returns
     -------
     callable
         A host callable ``(*args, row)`` returning the selected Jacobian row.
+
+    Raises
+    ------
+    TypeError
+        If CUDA-only options are passed for a CPU function.
 
     See Also
     --------
@@ -211,12 +300,10 @@ def jacrev_row(func: Callable) -> Callable:
     vjp : A reverse-mode product with an arbitrary output cotangent.
     jacfwd_column : The corresponding forward-mode column operation.
     """
-    if not is_annotated(func):
-        return lazy_derivative(func, "jacrev_row")
-    return load(build(func)).jacrev_row
+    return _differentiate(func, "jacrev_row", signature, cc)
 
 
-def jacfwd(func: Callable) -> Callable:
+def jacfwd(func: Callable, *, signature=None, cc=None) -> Callable:
     """
     Return a callable computing a whole forward-mode Jacobian.
 
@@ -232,28 +319,55 @@ def jacfwd(func: Callable) -> Callable:
     A fixed-size homogeneous tuple result produces an output-by-input tuple
     matrix.
 
+    A CUDA primal returns a homogeneous tuple, which Numba-CUDA-MLIR lowers to
+    a struct returned by value. One forward sweep gives a whole Jacobian
+    column, and one sweep per input fills the complete matrix, which the
+    derivative writes into a caller-owned ``n_out`` by ``n_args`` array::
+
+        jac = jacfwd(f)
+        # inside CUDA-compiled code:
+        jac(jacobian, x0, x1)
+
+    On a GPU ``jacobian`` costs ``n_out * n_args`` per thread, which stops
+    being viable well before the dimensions `jacfwd_column` handles
+    comfortably; prefer that when the whole matrix need not exist at once.
+
     Parameters
     ----------
     func : callable
-        A function returning a scalar or fixed homogeneous tuple.
+        A CPU function returning a scalar or fixed homogeneous
+        tuple, or a
+        ``@cuda.jit(device=True)`` dispatcher of the shape
+        ``UniTuple(dtype, n)(x0, ..., xn)``.
+    signature : numba_cuda_mlir.typing.Signature, optional
+        Concrete CUDA specialization every call site must resolve to. CUDA
+        argument types are otherwise inferred at each call site. Invalid for
+        CPU functions.
+    cc : tuple of int, optional
+        CUDA compute capability as ``(major, minor)``. Defaults to the current
+        device's.
 
     Returns
     -------
     callable
-        A host callable ``(*args)`` returning the Jacobian as a tuple or tuple
-        matrix.
+        For CPU, a host callable ``(*args)`` returning the Jacobian as a tuple
+        or tuple matrix. For CUDA, a device callable ``(jacobian, *args)``
+        returning nothing.
+
+    Raises
+    ------
+    TypeError
+        If CUDA-only options are passed for a CPU function.
 
     See Also
     --------
     jacfwd_column : One column of the same Jacobian, chosen at run time.
     jvp : Forward derivative of a scalar-output primal.
     """
-    if not is_annotated(func):
-        return lazy_derivative(func, "jacfwd")
-    return load(build(func)).jacfwd
+    return _differentiate(func, "jacfwd", signature, cc)
 
 
-def jacfwd_column(func: Callable) -> Callable:
+def jacfwd_column(func: Callable, *, signature=None, cc=None) -> Callable:
     """
     Return a callable computing one forward-mode Jacobian column.
 
@@ -269,25 +383,56 @@ def jacfwd_column(func: Callable) -> Callable:
     For a fixed-size homogeneous tuple result it returns that column as a
     tuple, with one derivative per output component.
 
+    For CUDA the unit seed is built inside the derivative -- one ``select``
+    per argument, no branching -- so the caller likewise passes an integer
+    rather than a tangent vector it would have to materialise::
+
+        col = jacfwd_column(f)
+        # inside CUDA-compiled code:
+        col(column, x0, x1, 1)   # column = d f / d x1
+
+    Because the seed is data rather than code, every column runs the identical
+    instruction stream and costs the same, which is what lets a warp's lanes
+    take different columns without diverging.
+
+    ``column`` receives the requested column and must hold ``n_out`` elements
+    of the primal's dtype. The primal values do not cross the call: a
+    tuple-returning primal hands Enzyme a struct, so the marker returns the
+    tangent struct directly.
+
     Parameters
     ----------
     func : callable
-        A function returning a scalar or fixed homogeneous tuple.
+        A CPU function returning a scalar or fixed homogeneous
+        tuple, or a
+        ``@cuda.jit(device=True)`` dispatcher of the shape
+        ``UniTuple(dtype, n)(x0, ..., xn)``.
+    signature : numba_cuda_mlir.typing.Signature, optional
+        Concrete CUDA specialization every call site must resolve to. CUDA
+        argument types are otherwise inferred at each call site. Invalid for
+        CPU functions.
+    cc : tuple of int, optional
+        CUDA compute capability as ``(major, minor)``. Defaults to the current
+        device's.
 
     Returns
     -------
     callable
-        A host callable ``(*args, index)`` returning one scalar or tuple
-        column.
+        For CPU, a host callable ``(*args, index)`` returning one scalar or a
+        tuple column. For CUDA, a device callable ``(column, *args, index)``
+        returning nothing.
+
+    Raises
+    ------
+    TypeError
+        If CUDA-only options are passed for a CPU function.
 
     See Also
     --------
     jacfwd : The whole Jacobian, one sweep per column.
     jvp : Forward derivative of a scalar-output primal.
     """
-    if not is_annotated(func):
-        return lazy_derivative(func, "jacfwd_column")
-    return load(build(func)).jacfwd_column
+    return _differentiate(func, "jacfwd_column", signature, cc)
 
 
 def _cached_transform(transform: Callable) -> functools.cached_property:
