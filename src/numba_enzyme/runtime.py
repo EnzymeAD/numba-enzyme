@@ -10,6 +10,9 @@ argument, uniformly for every arity (see `numba_enzyme.driver`).
 For a scalar result, ``jvp_<entry>`` returns a bare scalar. For a tuple result,
 it writes the output tangent through an explicit pointer.
 
+`lazy_derivative` defers all of that for a function without annotations,
+building one specialization for each tuple of argument types it is called with.
+
 See Also
 --------
 numba_enzyme.build.build : Produces the `BuiltKernel` this module loads.
@@ -27,11 +30,15 @@ Examples
 """
 
 import ctypes
+import inspect
 import operator
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from numba_enzyme.build import BuiltKernel
+import numba as nb
+
+from numba_enzyme.build import BuiltKernel, build
 
 _CTYPES_SCALAR_TYPE = {
     "double": ctypes.c_double,
@@ -39,6 +46,11 @@ _CTYPES_SCALAR_TYPE = {
     "i32": ctypes.c_int32,
     "i64": ctypes.c_int64,
 }
+
+# Loaded derivatives of unannotated functions, keyed by function and argument
+# types so every mode called with the same types shares one build.
+_SPECIALIZATIONS = {}
+_SPECIALIZATION_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -532,3 +544,165 @@ def load(built: BuiltKernel) -> Differentiable:
         n_args=n,
         n_outputs=m,
     )
+
+
+def _argument_type(value, position: int) -> nb.types.Type:
+    """
+    Infer the Numba type of one primal argument from its value.
+
+    Parameters
+    ----------
+    value : object
+        The argument as passed to a derivative callable.
+    position : int
+        Zero-based position of the argument, for error messages.
+
+    Returns
+    -------
+    numba.core.types.Type
+        Floating-point type of `value`.
+
+    Raises
+    ------
+    TypeError
+        If `value` is not a floating-point scalar. Integer arguments are
+        rejected rather than silently promoted, since a derivative with
+        respect to one is not defined.
+
+    See Also
+    --------
+    lazy_derivative : Specializes on the types this infers.
+
+    Examples
+    --------
+    >>> from numba_enzyme.runtime import _argument_type
+    >>> _argument_type(1.0, 0)
+    float64
+    """
+    try:
+        numba_type = nb.typeof(value)
+    except ValueError:
+        numba_type = None
+    if not isinstance(numba_type, nb.types.Float):
+        raise TypeError(
+            f"argument {position} is {type(value).__name__} {value!r}, but "
+            "differentiation needs floating-point arguments"
+        )
+    return numba_type
+
+
+def _specialization(func: Callable, arg_types: tuple) -> Differentiable:
+    """
+    Load, or reuse, the derivatives of a function for argument types.
+
+    Parameters
+    ----------
+    func : callable
+        Python function to differentiate.
+    arg_types : tuple of numba.core.types.Type
+        Concrete argument types to specialize for.
+
+    Returns
+    -------
+    Differentiable
+        Derivative callables for that specialization.
+
+    See Also
+    --------
+    lazy_derivative : Resolves `arg_types` from each call.
+    """
+    key = (func, arg_types)
+    with _SPECIALIZATION_LOCK:
+        differentiated = _SPECIALIZATIONS.get(key)
+        if differentiated is None:
+            differentiated = load(build(func, arg_types))
+            _SPECIALIZATIONS[key] = differentiated
+    return differentiated
+
+
+def lazy_derivative(func: Callable, mode: str) -> Callable:
+    """
+    Return a derivative callable that specializes on its argument types.
+
+    Nothing is built until the callable is called. Each call infers the
+    primal's argument types from its values, builds -- once per distinct tuple
+    of types -- the same shared object `build` would for an annotated
+    function, and forwards to its `mode` callable.
+
+    Parameters
+    ----------
+    func : callable
+        Python function to differentiate, with or without annotations.
+    mode : str
+        Name of a `Differentiable` derivative callable, such as ``"grad"``.
+
+    Returns
+    -------
+    callable
+        Host callable with the same call shape as ``load(built).<mode>``.
+
+    See Also
+    --------
+    load : Builds the callables this forwards to.
+
+    Examples
+    --------
+    >>> from numba_enzyme.runtime import lazy_derivative
+    >>> def f(x, y):
+    ...     return x * y
+    >>> lazy_derivative(f, "grad")(2.0, 3.0)  # doctest: +SKIP
+    (3.0, 2.0)
+    """
+    n = len(inspect.signature(func).parameters)
+    by_python_types = {}
+
+    def derivative(*args):
+        """
+        Compute the derivative, specializing on the primal's argument types.
+
+        Parameters
+        ----------
+        *args : object
+            Arguments in the call shape of ``load(built).<mode>``.
+
+        Returns
+        -------
+        object
+            That callable's result.
+
+        Raises
+        ------
+        TypeError
+            If the call passes the wrong number of primal values, or a primal
+            value is not a floating-point scalar.
+        """
+        if mode in ("jvp", "vjp"):
+            if len(args) != 2:
+                raise TypeError(
+                    f"{mode} expects a primal tuple and one more argument, "
+                    f"got {len(args)} arguments"
+                )
+            primal = tuple(args[0])
+        elif mode in ("jacfwd_column", "jacrev_row"):
+            if len(args) != n + 1:
+                raise TypeError(
+                    f"expected {n} primal arguments and one index, got {len(args)}"
+                )
+            primal = args[:-1]
+        else:
+            primal = args
+        if len(primal) != n:
+            raise TypeError(f"expected {n} primal values, got {len(primal)}")
+
+        key = tuple(map(type, primal))
+        differentiated = by_python_types.get(key)
+        if differentiated is None:
+            arg_types = tuple(
+                _argument_type(value, position) for position, value in enumerate(primal)
+            )
+            differentiated = by_python_types[key] = _specialization(func, arg_types)
+        return getattr(differentiated, mode)(*args)
+
+    derivative.__name__ = f"{mode}_{func.__name__}"
+    derivative.__qualname__ = derivative.__name__
+    return derivative

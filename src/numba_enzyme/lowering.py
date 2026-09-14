@@ -211,36 +211,140 @@ def _numba_return_type(annotation) -> tuple[nb.types.Type, nb.types.Type, int]:
         If the annotation is an empty, variadic, or heterogeneous tuple.
     """
     if typing.get_origin(annotation) is not tuple:
-        scalar_type = _numba_type_of(annotation)
-        _llvm_scalar_type(scalar_type)
-        return scalar_type, scalar_type, 1
+        return _split_return_type(_numba_type_of(annotation))
 
     annotations = typing.get_args(annotation)
     if len(annotations) < 2:
         raise LoweringError("tuple return annotation must contain at least two types")
     if Ellipsis in annotations:
         raise LoweringError("tuple return annotation must have a fixed size")
-
-    scalar_types = tuple(_numba_type_of(item) for item in annotations)
-    for scalar_type in scalar_types:
-        _llvm_scalar_type(scalar_type)
-    if any(scalar_type != scalar_types[0] for scalar_type in scalar_types[1:]):
-        raise LoweringError("tuple return annotation must be homogeneous")
-
-    n_outputs = len(scalar_types)
-    scalar_type = scalar_types[0]
-    return nb.types.UniTuple(scalar_type, n_outputs), scalar_type, n_outputs
+    # numba's Tuple constructor returns a UniTuple for homogeneous items.
+    return _split_return_type(
+        nb.types.Tuple([_numba_type_of(item) for item in annotations])
+    )
 
 
-def lower(func: Callable) -> LoweredKernel:
+def _split_return_type(return_type) -> tuple[nb.types.Type, nb.types.Type, int]:
+    """
+    Validate a Numba return type as a scalar or fixed homogeneous tuple.
+
+    Parameters
+    ----------
+    return_type : numba.core.types.Type
+        Return type from an annotation or from Numba's own type inference.
+
+    Returns
+    -------
+    return_type : numba.core.types.Type
+        `return_type` itself.
+    scalar_type : numba.core.types.Type
+        Scalar component type stored in the return value.
+    n_outputs : int
+        Number of scalar output components.
+
+    Raises
+    ------
+    LoweringError
+        If the result is a one-element or heterogeneous tuple, or a component
+        is not a supported scalar type.
+
+    See Also
+    --------
+    _numba_return_type : Resolves an annotation before delegating here.
+
+    Examples
+    --------
+    >>> import numba as nb
+    >>> from numba_enzyme.lowering import _split_return_type
+    >>> _split_return_type(nb.types.UniTuple(nb.types.float64, 2))[2]
+    2
+    """
+    if not isinstance(return_type, nb.types.BaseTuple):
+        _llvm_scalar_type(return_type)
+        return return_type, return_type, 1
+    if len(return_type) < 2:
+        raise LoweringError("tuple return must contain at least two values")
+    if not isinstance(return_type, nb.types.UniTuple):
+        raise LoweringError(f"tuple return must be homogeneous, not {return_type}")
+    _llvm_scalar_type(return_type.dtype)
+    return return_type, return_type.dtype, return_type.count
+
+
+def is_annotated(func: Callable) -> bool:
+    """
+    Report whether a function carries every annotation `lower` needs.
+
+    Parameters
+    ----------
+    func : callable
+        Python function to inspect.
+
+    Returns
+    -------
+    bool
+        Whether every parameter and the return value is annotated.
+
+    See Also
+    --------
+    lower : Uses these annotations when no argument types are given.
+
+    Examples
+    --------
+    >>> from numba_enzyme.lowering import is_annotated
+    >>> from numba_enzyme.types import Float64
+    >>> def f(x: Float64) -> Float64:
+    ...     return x * x
+    >>> is_annotated(f), is_annotated(lambda x: x * x)
+    (True, False)
+    """
+    hints = typing.get_type_hints(func)
+    parameters = inspect.signature(func).parameters
+    return "return" in hints and all(name in hints for name in parameters)
+
+
+def _infer_return_type(func: Callable, arg_types: tuple) -> nb.types.Type:
+    """
+    Infer a function's return type for concrete argument types.
+
+    Parameters
+    ----------
+    func : callable
+        Python function to type.
+    arg_types : tuple of numba.core.types.Type
+        Concrete argument types.
+
+    Returns
+    -------
+    numba.core.types.Type
+        The return type Numba infers for that specialization.
+
+    See Also
+    --------
+    lower : Compiles the specialization this types.
+
+    Examples
+    --------
+    >>> import numba as nb
+    >>> from numba_enzyme.lowering import _infer_return_type
+    >>> _infer_return_type(lambda x: (x, x), (nb.types.float32,))
+    UniTuple(float32, 2)
+    """
+    dispatcher = nb.njit(error_model="numpy")(func)
+    dispatcher.compile(arg_types)
+    return dispatcher.overloads[arg_types].signature.return_type
+
+
+def lower(func: Callable, arg_types=None) -> LoweredKernel:
     """
     Compile a Python function to a validated `LoweredKernel`.
 
-    Reads `func`'s parameter and return type annotations to build the Numba
-    signature. Parameters must use `numba_enzyme.types` classes; the return may
-    also be a fixed-size homogeneous tuple of those classes. It compiles the
-    function with :func:`numba.cfunc`, then locates and validates the resulting
-    retptr/excinfo entry point.
+    Without `arg_types`, reads `func`'s parameter and return type annotations to
+    build the Numba signature. Parameters must use `numba_enzyme.types` classes;
+    the return may also be a fixed-size homogeneous tuple of those classes. With
+    `arg_types`, annotations are ignored and Numba infers the return type for
+    those arguments instead. Either way it compiles the function with
+    :func:`numba.cfunc`, then locates and validates the resulting retptr/excinfo
+    entry point.
 
     Parameters
     ----------
@@ -248,6 +352,8 @@ def lower(func: Callable) -> LoweredKernel:
         A Python function whose scalar parameters use `numba_enzyme.types`
         annotations and whose return is a scalar or fixed homogeneous tuple of
         those types.
+    arg_types : tuple of numba.core.types.Type, optional
+        Concrete argument types to compile for, in place of annotations.
 
     Returns
     -------
@@ -274,16 +380,28 @@ def lower(func: Callable) -> LoweredKernel:
     >>> lower(f).arg_types  # doctest: +SKIP
     ('double*', '{ i8*, i32, i8*, i8*, i32 }**', 'double')
     """
-    hints = typing.get_type_hints(func)
     params = inspect.signature(func).parameters
-
-    try:
-        arg_numba_types = [_numba_type_of(hints[name]) for name in params]
-        ret_numba_type, ret_scalar_type, n_outputs = _numba_return_type(hints["return"])
-    except KeyError as exc:
-        raise LoweringError(
-            f"{func!r} is missing a type annotation for {exc.args[0]!r}"
-        ) from exc
+    if arg_types is None:
+        hints = typing.get_type_hints(func)
+        try:
+            arg_numba_types = [_numba_type_of(hints[name]) for name in params]
+            ret_numba_type, ret_scalar_type, n_outputs = _numba_return_type(
+                hints["return"]
+            )
+        except KeyError as exc:
+            raise LoweringError(
+                f"{func!r} is missing a type annotation for {exc.args[0]!r}"
+            ) from exc
+    else:
+        arg_numba_types = list(arg_types)
+        if len(arg_numba_types) != len(params):
+            raise LoweringError(
+                f"{func!r} takes {len(params)} arguments, "
+                f"not the {len(arg_numba_types)} types given"
+            )
+        ret_numba_type, ret_scalar_type, n_outputs = _split_return_type(
+            _infer_return_type(func, tuple(arg_numba_types))
+        )
 
     sig = ret_numba_type(*arg_numba_types)
     compiled = nb.cfunc(sig, error_model="numpy")(func)

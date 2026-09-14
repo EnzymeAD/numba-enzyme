@@ -18,9 +18,14 @@ pip install numba-enzyme
 
 ## Usage
 
-Arguments of the function must be annotated by the `numba_enzyme.types`. This is required to compile
-the function to a Numba `cfunc`. Then use `grad`, `jvp`, `jacfwd`, or
-`jacfwd_column` and pass the inputs. You can also decorate your function `f`
+Write an ordinary Python function and pass it to `grad`, `jvp`, `jacfwd`, or
+any of the other transforms below. No type annotations are needed: like a Numba
+`njit` function, each derivative callable infers the argument types from the
+values it is called with and compiles one specialization per distinct set of
+types, reusing it afterwards. Arguments must be floating-point scalars.
+Alternatively, annotate every parameter and the return value with
+`numba_enzyme.types` to fix the types up front, in which case the function is
+compiled as soon as it is transformed. You can also decorate your function `f`
 with `@differentiable` to expose each operation as an attribute.
 
 ```python
@@ -37,14 +42,14 @@ from numba_enzyme import (
 )
 from numba_enzyme.types import Float64
 
-def f(x: Float64, y: Float64) -> Float64:
+def f(x, y):
     return x * y + math.cos(x * y)
     # alternatively, x * y + np.cos(x * y)
 
-grad(f)(1.0, 2.0)               # -> (df/dx, df/dy)
+grad(f)(1.0, 2.0)               # -> (df/dx, df/dy), compiled for float64 args
 jvp(f)((1.0, 2.0), (1.0, 0.0))  # -> directional derivative along (1.0, 0.0)
 
-def f_vec(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+def f_vec(x, y):
     return x * y, x * x + y
 
 jacfwd(f_vec)(1.0, 2.0)           # -> ((2.0, 1.0), (2.0, 1.0))
@@ -54,7 +59,7 @@ jacrev_row(f_vec)(1.0, 2.0, 1)     # -> (2.0, 1.0)
 vjp(f_vec)((1.0, 2.0), (0.0, 1.0)) # -> (2.0, 1.0)
 
 @differentiable
-def g(x: Float64, y: Float64) -> Float64:
+def g(x: Float64, y: Float64) -> Float64:  # annotations fix the types up front
     return x * y + math.cos(x * y)
     # alternatively, x * y + np.cos(x * y)
 
@@ -88,8 +93,8 @@ use reverse mode, while `jacfwd` uses one forward sweep per input.
 ### Scope
 
 * It is still not possible to mark the arguments as active or constant.
-* CPU arguments must be scalar; results may be scalar or fixed-size homogeneous
-  tuples of scalars. General array inputs and outputs are not yet supported.
+* CPU arguments must be floating-point scalars; results may be scalar or
+  fixed-size homogeneous tuples of scalars. General array inputs and outputs are not yet supported.
 * Linear algebra e.g. `np.dot`, `np.linalg.norm` etc are not supported.
 
 ## License

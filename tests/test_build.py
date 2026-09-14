@@ -5,6 +5,7 @@ behavior (hit/miss).
 
 import math
 
+import numba as nb
 import pytest
 
 from numba_enzyme.build import build
@@ -92,3 +93,19 @@ def test_vector_output_metadata_survives_a_cache_hit():
     assert second.from_cache is True
     assert load(second).jacfwd_column(2.0, 3.0, 1) == pytest.approx((2.0, 1.0))
     assert load(second).jacrev_row(2.0, 3.0, 1) == pytest.approx((1.0, 1.0))
+
+
+def plain(x, y):
+    return x * y
+
+
+def test_inferred_argument_types_are_part_of_the_cache_key():
+    double = build(plain, (nb.types.float64, nb.types.float64))
+    single = build(plain, (nb.types.float32, nb.types.float32))
+    assert double.path != single.path
+    assert (double.return_type, single.return_type) == ("double", "float")
+
+    again = build(plain, (nb.types.float64, nb.types.float64))
+    assert again.from_cache is True
+    assert again.path == double.path
+    assert load(again).grad(2.0, 3.0) == pytest.approx((3.0, 2.0))

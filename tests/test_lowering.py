@@ -1,6 +1,7 @@
 import inspect
 import math
 
+import numba as nb
 import pytest
 
 from numba_enzyme.lowering import LoweredKernel, LoweringError, lower
@@ -85,3 +86,26 @@ def f_variadic(x: Float64) -> tuple[Float64, ...]:
 def test_lower_rejects_unsupported_tuple_returns(func, message):
     with pytest.raises(LoweringError, match=message):
         lower(func)
+
+
+def plain_vector(x, y):
+    return x * y, x * x + y
+
+
+def plain_mixed(x, n):
+    return x, n
+
+
+def test_lower_infers_the_return_type_from_argument_types():
+    result = lower(plain_vector, arg_types=(nb.types.float32, nb.types.float32))
+    assert result.n_args == 2
+    assert result.n_outputs == 2
+    assert result.return_type == "float"
+    assert result.arg_types[2:] == ("float", "float")
+
+
+def test_lower_rejects_an_inferred_heterogeneous_tuple():
+    with pytest.raises(LoweringError, match="must be homogeneous"):
+        lower(plain_mixed, arg_types=(nb.types.float64, nb.types.int64))
+    with pytest.raises(LoweringError, match="takes 2 arguments"):
+        lower(plain_vector, arg_types=(nb.types.float64,))

@@ -4,6 +4,10 @@ Public API tying lowering, driver synthesis, build, and runtime together.
 Exposes the public gradient, Jacobian, JVP, and VJP transformations and the
 `differentiable` decorator.
 
+A function annotated with `numba_enzyme.types` is compiled when it is
+transformed. Without annotations, it is instead specialized from the argument
+types of each call to the returned callable, as a Numba ``njit`` function is.
+
 See Also
 --------
 numba_enzyme.build.build : Orchestrates the compile pipeline these
@@ -26,7 +30,8 @@ import functools
 from collections.abc import Callable
 
 from numba_enzyme.build import build
-from numba_enzyme.runtime import load
+from numba_enzyme.lowering import is_annotated
+from numba_enzyme.runtime import lazy_derivative, load
 
 
 def grad(func: Callable) -> Callable:
@@ -36,8 +41,9 @@ def grad(func: Callable) -> Callable:
     Parameters
     ----------
     func : callable
-        A scalar-output Python function whose parameters and return value are
-        each annotated with a `numba_enzyme.types` class.
+        A scalar-output Python function. Argument and return types come from
+        `numba_enzyme.types` annotations when it has them all, and are
+        otherwise inferred from each call.
 
     Returns
     -------
@@ -48,7 +54,9 @@ def grad(func: Callable) -> Callable:
     Raises
     ------
     TypeError
-        If `func` has a tuple result.
+        If `func` has a tuple result. An unannotated function's result is only
+        known once the returned callable is called, so that callable raises
+        instead.
 
     See Also
     --------
@@ -64,6 +72,8 @@ def grad(func: Callable) -> Callable:
     >>> grad(f)(2.0)  # doctest: +SKIP
     (4.0,)
     """
+    if not is_annotated(func):
+        return lazy_derivative(func, "grad")
     differentiated = load(build(func))
     if differentiated.n_outputs != 1:
         raise TypeError(
@@ -80,8 +90,9 @@ def jvp(func: Callable) -> Callable:
     Parameters
     ----------
     func : callable
-        A Python function with annotated scalar parameters and a scalar or
-        fixed homogeneous tuple result.
+        A Python function with scalar parameters and a scalar or fixed
+        homogeneous tuple result. Types are inferred from each call unless it
+        is fully annotated with `numba_enzyme.types`.
 
     Returns
     -------
@@ -104,6 +115,8 @@ def jvp(func: Callable) -> Callable:
     >>> jvp(f)((2.0,), (1.0,))  # doctest: +SKIP
     4.0
     """
+    if not is_annotated(func):
+        return lazy_derivative(func, "jvp")
     return load(build(func)).jvp
 
 
@@ -123,7 +136,7 @@ def vjp(func: Callable) -> Callable:
     Parameters
     ----------
     func : callable
-        An annotated CPU function returning a scalar or fixed homogeneous
+        A CPU function returning a scalar or fixed homogeneous
         tuple.
 
     Returns
@@ -137,6 +150,8 @@ def vjp(func: Callable) -> Callable:
     jvp : The forward-mode product.
     jacrev : The complete reverse-mode Jacobian.
     """
+    if not is_annotated(func):
+        return lazy_derivative(func, "vjp")
     return load(build(func)).vjp
 
 
@@ -152,7 +167,7 @@ def jacrev(func: Callable) -> Callable:
     Parameters
     ----------
     func : callable
-        An annotated CPU function returning a scalar or fixed homogeneous
+        A CPU function returning a scalar or fixed homogeneous
         tuple.
 
     Returns
@@ -167,6 +182,8 @@ def jacrev(func: Callable) -> Callable:
     vjp : A reverse-mode product with an arbitrary output cotangent.
     jacfwd : The forward-mode counterpart.
     """
+    if not is_annotated(func):
+        return lazy_derivative(func, "jacrev")
     return load(build(func)).jacrev
 
 
@@ -180,7 +197,7 @@ def jacrev_row(func: Callable) -> Callable:
     Parameters
     ----------
     func : callable
-        An annotated CPU function returning a scalar or fixed homogeneous
+        A CPU function returning a scalar or fixed homogeneous
         tuple.
 
     Returns
@@ -194,6 +211,8 @@ def jacrev_row(func: Callable) -> Callable:
     vjp : A reverse-mode product with an arbitrary output cotangent.
     jacfwd_column : The corresponding forward-mode column operation.
     """
+    if not is_annotated(func):
+        return lazy_derivative(func, "jacrev_row")
     return load(build(func)).jacrev_row
 
 
@@ -201,7 +220,7 @@ def jacfwd(func: Callable) -> Callable:
     """
     Return a callable computing a whole forward-mode Jacobian.
 
-    For an annotated CPU function, the returned callable takes the same
+    For a CPU function, the returned callable takes the same
     positional arguments as `func`. A scalar result produces one partial
     derivative per argument as a `tuple`::
 
@@ -216,7 +235,7 @@ def jacfwd(func: Callable) -> Callable:
     Parameters
     ----------
     func : callable
-        An annotated function returning a scalar or fixed homogeneous tuple.
+        A function returning a scalar or fixed homogeneous tuple.
 
     Returns
     -------
@@ -229,6 +248,8 @@ def jacfwd(func: Callable) -> Callable:
     jacfwd_column : One column of the same Jacobian, chosen at run time.
     jvp : Forward derivative of a scalar-output primal.
     """
+    if not is_annotated(func):
+        return lazy_derivative(func, "jacfwd")
     return load(build(func)).jacfwd
 
 
@@ -236,7 +257,7 @@ def jacfwd_column(func: Callable) -> Callable:
     """
     Return a callable computing one forward-mode Jacobian column.
 
-    For an annotated CPU function, the returned callable takes the primal
+    For a CPU function, the returned callable takes the primal
     arguments followed by the zero-based column index. It returns the selected
     partial derivative for a scalar result::
 
@@ -251,7 +272,7 @@ def jacfwd_column(func: Callable) -> Callable:
     Parameters
     ----------
     func : callable
-        An annotated function returning a scalar or fixed homogeneous tuple.
+        A function returning a scalar or fixed homogeneous tuple.
 
     Returns
     -------
@@ -264,6 +285,8 @@ def jacfwd_column(func: Callable) -> Callable:
     jacfwd : The whole Jacobian, one sweep per column.
     jvp : Forward derivative of a scalar-output primal.
     """
+    if not is_annotated(func):
+        return lazy_derivative(func, "jacfwd_column")
     return load(build(func)).jacfwd_column
 
 
@@ -339,8 +362,8 @@ class Differentiable:
     Parameters
     ----------
     func : callable
-        A Python function whose scalar parameters and scalar or homogeneous
-        tuple result are annotated with `numba_enzyme.types` classes.
+        A Python function with scalar parameters and a scalar or homogeneous
+        tuple result, optionally annotated with `numba_enzyme.types` classes.
 
     See Also
     --------
@@ -384,8 +407,8 @@ def differentiable(func: Callable) -> Differentiable:
     Parameters
     ----------
     func : callable
-        A Python function whose scalar parameters and scalar or homogeneous
-        tuple result are annotated with `numba_enzyme.types` classes.
+        A Python function with scalar parameters and a scalar or homogeneous
+        tuple result, optionally annotated with `numba_enzyme.types` classes.
 
     Returns
     -------

@@ -145,7 +145,7 @@ def _toolchain_fingerprint() -> str:
     return "|".join(parts)
 
 
-def _cache_key(func: Callable) -> str:
+def _cache_key(func: Callable, arg_types=None) -> str:
     """
     Compute `build`'s cache key for a function.
 
@@ -153,12 +153,15 @@ def _cache_key(func: Callable) -> str:
     ----------
     func : callable
         The function to key on.
+    arg_types : tuple of numba.core.types.Type, optional
+        Argument types the build specializes for, when they come from a call
+        rather than from `func`'s own annotations.
 
     Returns
     -------
     str
-        A hex-encoded SHA-256 digest of `func`'s source text combined
-        with the current `_toolchain_fingerprint`.
+        A hex-encoded SHA-256 digest of `func`'s source text and any
+        `arg_types`, combined with the current `_toolchain_fingerprint`.
 
     Examples
     --------
@@ -175,6 +178,8 @@ def _cache_key(func: Callable) -> str:
         + "\n"
         + _toolchain_fingerprint()
     )
+    if arg_types is not None:
+        digest_input += "\narg-types=" + ",".join(map(str, arg_types))
     return hashlib.sha256(digest_input.encode()).hexdigest()
 
 
@@ -222,7 +227,7 @@ def _locate_runtime_libs() -> list[Path]:
     return list(found.values())
 
 
-def build(func: Callable) -> BuiltKernel:
+def build(func: Callable, arg_types=None) -> BuiltKernel:
     """
     Build, or fetch from cache, the shared object for a function.
 
@@ -237,7 +242,11 @@ def build(func: Callable) -> BuiltKernel:
     ----------
     func : callable
         A Python function whose parameters and return value are each
-        annotated with a `numba_enzyme.types` class.
+        annotated with a `numba_enzyme.types` class, unless `arg_types` is
+        given.
+    arg_types : tuple of numba.core.types.Type, optional
+        Concrete argument types to build for instead of the annotations. The
+        return type is then inferred, and the types are part of the cache key.
 
     Returns
     -------
@@ -259,7 +268,7 @@ def build(func: Callable) -> BuiltKernel:
     >>> build(f).path.suffix  # doctest: +SKIP
     '.so'
     """
-    entry_dir = _cache_dir() / _cache_key(func)
+    entry_dir = _cache_dir() / _cache_key(func, arg_types)
     so_path = entry_dir / "kernel.so"
     meta_path = entry_dir / "meta.json"
 
@@ -276,7 +285,7 @@ def build(func: Callable) -> BuiltKernel:
         meta["arg_types"] = tuple(meta["arg_types"])
         return BuiltKernel(path=so_path, from_cache=True, **meta)
 
-    kernel = lower(func)
+    kernel = lower(func, arg_types)
     drv = synthesise(kernel)
     tc = get_toolchain()
 

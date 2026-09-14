@@ -1,7 +1,7 @@
 """
 Differentiate Numba-compiled functions with Enzyme.
 
-This package makes a pure-math Python function (annotated with
+This package makes a pure-math Python function (optionally annotated with
 :mod:`numba_enzyme.types`) differentiable by compiling it with Numba,
 synthesising an Enzyme driver for it with :mod:`llvmlite`, and running
 the standalone Enzyme LLVM pass over the result. Both reverse-mode
