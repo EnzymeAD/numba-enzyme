@@ -64,6 +64,13 @@ class Differentiable:
     jacfwd_column : callable
         Computes one forward-mode Jacobian column. Takes `n_args` primal values
         followed by a column index and returns a scalar or output tuple.
+    vjp : callable
+        Computes a reverse-mode vector-Jacobian product from primal values and
+        an output cotangent.
+    jacrev : callable
+        Computes the full Jacobian in reverse mode, one output row per sweep.
+    jacrev_row : callable
+        Computes one runtime-selected Jacobian row in reverse mode.
     n_args : int
         Number of scalar arguments the underlying function takes.
     n_outputs : int
@@ -88,6 +95,9 @@ class Differentiable:
     jvp: Callable[[tuple[float, ...], tuple[float, ...]], float | tuple[float, ...]]
     jacfwd: Callable[..., tuple]
     jacfwd_column: Callable[..., float | tuple[float, ...]]
+    vjp: Callable[[tuple[float, ...], object], tuple[float, ...]]
+    jacrev: Callable[..., tuple]
+    jacrev_row: Callable[..., tuple[float, ...]]
     n_args: int
     n_outputs: int
 
@@ -441,11 +451,84 @@ def load(built: BuiltKernel) -> Differentiable:
         xs, column = _split_index(args, n, n, "column", "arguments")
         return jvp(xs, _unit(n, column))
 
+    def jacrev(*xs: float) -> tuple:
+        """
+        Compute the full reverse-mode Jacobian.
+
+        Parameters
+        ----------
+        *xs : float
+            The point to differentiate at, one value per primal argument.
+
+        Returns
+        -------
+        tuple
+            A derivative tuple for a scalar result or an output-by-input tuple
+            matrix for a vector result.
+
+        Raises
+        ------
+        TypeError
+            If the number of arguments given doesn't match `n`.
+
+        Examples
+        --------
+        >>> from numba_enzyme.build import build
+        >>> from numba_enzyme.runtime import load
+        >>> from numba_enzyme.types import Float64
+        >>> def f(x: Float64) -> Float64:
+        ...     return x * x
+        >>> load(build(f)).jacrev(2.0)  # doctest: +SKIP
+        (4.0,)
+        """
+        if len(xs) != n:
+            raise TypeError(f"expected {n} arguments, got {len(xs)}")
+        if m == 1:
+            return vjp(xs, 1.0)
+        return tuple(vjp(xs, _unit(m, row)) for row in range(m))
+
+    def jacrev_row(*args: float) -> tuple[float, ...]:
+        """
+        Compute one row of the reverse-mode Jacobian.
+
+        Parameters
+        ----------
+        *args : float
+            The primal values followed by a zero-based integer row index.
+
+        Returns
+        -------
+        tuple of float
+            One derivative per primal input for the selected output row.
+
+        Raises
+        ------
+        TypeError
+            If the number of arguments is wrong or the index is not integral.
+        IndexError
+            If the row index is out of range.
+
+        Examples
+        --------
+        >>> from numba_enzyme.build import build
+        >>> from numba_enzyme.runtime import load
+        >>> from numba_enzyme.types import Float64
+        >>> def f(x: Float64) -> Float64:
+        ...     return x * x
+        >>> load(build(f)).jacrev_row(2.0, 0)  # doctest: +SKIP
+        (4.0,)
+        """
+        xs, row = _split_index(args, n, m, "row", "outputs")
+        return vjp(xs, 1.0 if m == 1 else _unit(m, row))
+
     return Differentiable(
         grad=grad,
         jvp=jvp,
         jacfwd=jacfwd,
         jacfwd_column=jacfwd_column,
+        vjp=vjp,
+        jacrev=jacrev,
+        jacrev_row=jacrev_row,
         n_args=n,
         n_outputs=m,
     )

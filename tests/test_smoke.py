@@ -16,7 +16,10 @@ def test_public_derivative_api_is_exported():
         "grad",
         "jacfwd",
         "jacfwd_column",
+        "jacrev",
+        "jacrev_row",
         "jvp",
+        "vjp",
     }
     assert expected <= set(numba_enzyme.__all__)
     assert all(callable(getattr(numba_enzyme, name)) for name in expected)

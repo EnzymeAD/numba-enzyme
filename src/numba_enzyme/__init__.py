@@ -35,7 +35,10 @@ from numba_enzyme.core import (
     grad,
     jacfwd,
     jacfwd_column,
+    jacrev,
+    jacrev_row,
     jvp,
+    vjp,
 )
 
 __version__ = version("numba-enzyme")
@@ -46,5 +49,8 @@ __all__ = [
     "grad",
     "jacfwd",
     "jacfwd_column",
+    "jacrev",
+    "jacrev_row",
     "jvp",
+    "vjp",
 ]

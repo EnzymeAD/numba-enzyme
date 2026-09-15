@@ -78,3 +78,23 @@ def test_jacfwd_column_validates_arguments_and_index():
         diff.jacfwd_column(1.0, 2.0, 2)
     with pytest.raises(IndexError, match="out of range"):
         diff.jacfwd_column(1.0, 2.0, -1)
+
+
+def test_vjp_validates_scalar_shapes():
+    diff = load(build(f))
+    with pytest.raises(TypeError, match="expected 2 primal values"):
+        diff.vjp((1.0,), 1.0)
+    with pytest.raises(TypeError, match="expected a scalar cotangent"):
+        diff.vjp((1.0, 2.0), (1.0,))
+
+
+def test_jacrev_and_row_validate_arguments():
+    diff = load(build(f))
+    with pytest.raises(TypeError, match="expected 2 arguments"):
+        diff.jacrev(1.0)
+    with pytest.raises(TypeError, match="2 primal arguments"):
+        diff.jacrev_row(1.0, 0)
+    with pytest.raises(TypeError, match="must be an integer"):
+        diff.jacrev_row(1.0, 2.0, 0.5)
+    with pytest.raises(IndexError, match="out of range"):
+        diff.jacrev_row(1.0, 2.0, 1)

@@ -9,7 +9,10 @@ from numba_enzyme.core import (
     grad,
     jacfwd,
     jacfwd_column,
+    jacrev,
+    jacrev_row,
     jvp,
+    vjp,
 )
 from numba_enzyme.types import Float64
 
@@ -66,6 +69,16 @@ def test_jacfwd_column_matches_analytic():
     assert column(x, y, 1) == pytest.approx(expected[1], abs=1e-9)
 
 
+def test_scalar_output_public_reverse_apis():
+    x, y = 1.3, 0.7
+    expected = f_grad(x, y)
+    assert vjp(f)((x, y), 2.0) == pytest.approx(
+        tuple(2 * value for value in expected), abs=1e-9
+    )
+    assert jacrev(f)(x, y) == pytest.approx(expected, abs=1e-9)
+    assert jacrev_row(f)(x, y, 0) == pytest.approx(expected, abs=1e-9)
+
+
 def test_vector_output_public_forward_apis():
     x, y = 1.3, 0.7
     assert jvp(f_vector)((x, y), (1.0, 0.0)) == pytest.approx((y, 2 * x))
@@ -73,6 +86,17 @@ def test_vector_output_public_forward_apis():
     assert jacobian[0] == pytest.approx((y, x))
     assert jacobian[1] == pytest.approx((2 * x, 1.0))
     assert jacfwd_column(f_vector)(x, y, 1) == pytest.approx((x, 1.0))
+
+
+def test_vector_output_public_reverse_apis():
+    x, y = 1.3, 0.7
+    assert vjp(f_vector)((x, y), (0.25, -0.5)) == pytest.approx(
+        (y * 0.25 - x, x * 0.25 - 0.5)
+    )
+    jacobian = jacrev(f_vector)(x, y)
+    assert jacobian[0] == pytest.approx((y, x))
+    assert jacobian[1] == pytest.approx((2 * x, 1.0))
+    assert jacrev_row(f_vector)(x, y, 1) == pytest.approx((2 * x, 1.0))
 
 
 def test_grad_rejects_vector_output():
@@ -92,6 +116,9 @@ def test_differentiable_wrapper_exposes_all_derivative_modes():
     assert f_decorated.jvp((x, y), (1.0, 0.0)) == pytest.approx(expected[0], abs=1e-9)
     assert f_decorated.jacfwd(x, y) == pytest.approx(expected, abs=1e-9)
     assert f_decorated.jacfwd_column(x, y, 1) == pytest.approx(expected[1], abs=1e-9)
+    assert f_decorated.vjp((x, y), 1.0) == pytest.approx(expected, abs=1e-9)
+    assert f_decorated.jacrev(x, y) == pytest.approx(expected, abs=1e-9)
+    assert f_decorated.jacrev_row(x, y, 0) == pytest.approx(expected, abs=1e-9)
 
 
 def test_differentiable_grad_is_cached():
@@ -104,3 +131,12 @@ def test_differentiable_forward_jacobian_callables_are_cached():
     column = f_decorated.jacfwd_column
     assert f_decorated.jacfwd is whole
     assert f_decorated.jacfwd_column is column
+
+
+def test_differentiable_reverse_jacobian_callables_are_cached():
+    product = f_decorated.vjp
+    whole = f_decorated.jacrev
+    row = f_decorated.jacrev_row
+    assert f_decorated.vjp is product
+    assert f_decorated.jacrev is whole
+    assert f_decorated.jacrev_row is row

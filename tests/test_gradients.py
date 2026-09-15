@@ -112,6 +112,20 @@ def test_forward_jacobian_matches_analytic(func, analytic_grad):
         assert diff.jacfwd_column(*xs, column) == pytest.approx(expected, abs=1e-9)
 
 
+@pytest.mark.parametrize("func,analytic_grad", _CASES)
+def test_reverse_products_and_jacobian_match_analytic(func, analytic_grad):
+    diff = load(build(func))
+    n = diff.n_args
+    xs = tuple(0.6 + 0.25 * i for i in range(n))
+    analytic = analytic_grad(*xs)
+
+    assert diff.vjp(xs, 2.0) == pytest.approx(
+        tuple(2 * value for value in analytic), abs=1e-9
+    )
+    assert diff.jacrev(*xs) == pytest.approx(analytic, abs=1e-9)
+    assert diff.jacrev_row(*xs, 0) == pytest.approx(analytic, abs=1e-9)
+
+
 @pytest.mark.parametrize("func", [h1, h2, h3, h4])
 def test_no_call_through_a_bitcast_after_linking(func):
     """

@@ -91,3 +91,4 @@ def test_vector_output_metadata_survives_a_cache_hit():
     assert second.jvp_symbol == first.jvp_symbol
     assert second.from_cache is True
     assert load(second).jacfwd_column(2.0, 3.0, 1) == pytest.approx((2.0, 1.0))
+    assert load(second).jacrev_row(2.0, 3.0, 1) == pytest.approx((1.0, 1.0))

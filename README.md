@@ -30,7 +30,10 @@ from numba_enzyme import (
     grad,
     jacfwd,
     jacfwd_column,
+    jacrev,
+    jacrev_row,
     jvp,
+    vjp,
 )
 from numba_enzyme.types import Float64
 
@@ -46,6 +49,9 @@ def f_vec(x: Float64, y: Float64) -> tuple[Float64, Float64]:
 
 jacfwd(f_vec)(1.0, 2.0)           # -> ((2.0, 1.0), (2.0, 1.0))
 jacfwd_column(f_vec)(1.0, 2.0, 0)  # -> (2.0, 2.0)
+jacrev(f_vec)(1.0, 2.0)            # -> ((2.0, 1.0), (2.0, 1.0))
+jacrev_row(f_vec)(1.0, 2.0, 1)     # -> (2.0, 1.0)
+vjp(f_vec)((1.0, 2.0), (0.0, 1.0)) # -> (2.0, 1.0)
 
 @differentiable
 def g(x: Float64, y: Float64) -> Float64:
@@ -59,7 +65,8 @@ g.jvp((1.0, 2.0), (1.0, 0.0))  # forward-mode JVP
 
 `grad` requires its target function to return exactly one scalar. It does not
 accept tuple-valued targets. `jvp`, `jacfwd`, and `jacfwd_column` handle both
-scalar and vector outputs. Vector outputs use fixed-size homogeneous tuples.
+scalar and vector outputs, as do their reverse-mode counterparts `vjp`,
+`jacrev`, and `jacrev_row`. CPU vector outputs use fixed-size homogeneous tuples.
 Full Jacobians are returned as output-by-input tuple matrices.
 
 ### Choosing a differentiation operation
@@ -69,10 +76,14 @@ Full Jacobians are returned as output-by-input tuple matrices.
 | `grad` | Reverse | Gradient of a **single scalar output** in one reverse sweep. Prefer this for scalar losses, particularly with many inputs. |
 | `jacfwd` | Forward | Complete Jacobian, using one sweep per input. Prefer it when there are relatively few inputs. |
 | `jacfwd_column` | Forward | One Jacobian column for a selected input. Use it when only that input's effect is needed or storing the full matrix is undesirable. |
+| `jacrev` | Reverse | Complete Jacobian, using one sweep per output. Prefer it when there are relatively few outputs. |
+| `jacrev_row` | Reverse | One Jacobian row for a selected output. Use it when only that output's gradient is needed. |
 | `jvp` | Forward | Jacobian-vector product `J @ tangent` without constructing the Jacobian. Use it for a known input direction. |
+| `vjp` | Reverse | Vector-Jacobian product `cotangent @ J` without constructing the Jacobian. Use it for backpropagation from a known output cotangent. |
 
-For a scalar-output function, `grad` and `jacfwd` have the same values and
-tuple shape, by reverse and forward mode respectively.
+For a scalar-output function, `grad`, `jacfwd`, and `jacrev` have the same
+values and tuple shape. Their computational paths differ: `grad` and `jacrev`
+use reverse mode, while `jacfwd` uses one forward sweep per input.
 
 ### Scope
 

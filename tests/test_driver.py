@@ -92,11 +92,18 @@ def test_vector_output_forward_derivatives():
     assert diff.jacfwd_column(x, y, 1) == pytest.approx((x, 1.0), abs=1e-9)
 
 
-def test_vector_output_rejects_grad():
+def test_vector_output_reverse_derivatives():
     diff = load(build(f_vector))
+    x, y = 1.3, 0.7
 
-    with pytest.raises(TypeError, match="scalar-output"):
-        diff.grad(1.3, 0.7)
+    assert diff.vjp((x, y), (0.25, -0.5)) == pytest.approx(
+        (y * 0.25 - x, x * 0.25 - 0.5), abs=1e-9
+    )
+    jacobian = diff.jacrev(x, y)
+    assert jacobian[0] == pytest.approx((y, x), abs=1e-9)
+    assert jacobian[1] == pytest.approx((2 * x, 1.0), abs=1e-9)
+    assert diff.jacrev_row(x, y, 0) == pytest.approx((y, x), abs=1e-9)
+    assert diff.jacrev_row(x, y, 1) == pytest.approx((2 * x, 1.0), abs=1e-9)
 
 
 def test_float32_vector_output_uses_float32_runtime_abi():
@@ -104,3 +111,6 @@ def test_float32_vector_output_uses_float32_runtime_abi():
     jacobian = diff.jacfwd(1.25, 0.75)
     assert jacobian[0] == pytest.approx((0.75, 1.25), abs=1e-6)
     assert jacobian[1] == pytest.approx((1.0, 1.0), abs=1e-6)
+    reverse = diff.jacrev(1.25, 0.75)
+    assert reverse[0] == pytest.approx((0.75, 1.25), abs=1e-6)
+    assert reverse[1] == pytest.approx((1.0, 1.0), abs=1e-6)

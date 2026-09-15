@@ -107,6 +107,96 @@ def jvp(func: Callable) -> Callable:
     return load(build(func)).jvp
 
 
+def vjp(func: Callable) -> Callable:
+    """
+    Return a callable computing a reverse-mode vector-Jacobian product.
+
+    The returned CPU callable takes a tuple of primal inputs and an output
+    cotangent. The cotangent is a scalar when `func` returns a scalar and a
+    tuple matching a tuple-valued result::
+
+        def f(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+            return x * y, x * x + y
+
+        vjp(f)((2.0, 3.0), (1.0, 0.0))  # (3.0, 2.0)
+
+    Parameters
+    ----------
+    func : callable
+        An annotated CPU function returning a scalar or fixed homogeneous
+        tuple.
+
+    Returns
+    -------
+    callable
+        A host callable ``(primals, cotangent)`` returning one input
+        cotangent per argument.
+
+    See Also
+    --------
+    jvp : The forward-mode product.
+    jacrev : The complete reverse-mode Jacobian.
+    """
+    return load(build(func)).vjp
+
+
+def jacrev(func: Callable) -> Callable:
+    """
+    Return a callable computing a whole reverse-mode Jacobian.
+
+    The returned CPU callable takes the same positional arguments as `func`.
+    A scalar result produces one derivative per input; a fixed homogeneous
+    tuple result produces an output-by-input tuple matrix. Reverse mode uses
+    one sweep per output component.
+
+    Parameters
+    ----------
+    func : callable
+        An annotated CPU function returning a scalar or fixed homogeneous
+        tuple.
+
+    Returns
+    -------
+    callable
+        A host callable ``(*args)`` returning a derivative tuple or Jacobian
+        tuple matrix.
+
+    See Also
+    --------
+    jacrev_row : One runtime-selected row of the same Jacobian.
+    vjp : A reverse-mode product with an arbitrary output cotangent.
+    jacfwd : The forward-mode counterpart.
+    """
+    return load(build(func)).jacrev
+
+
+def jacrev_row(func: Callable) -> Callable:
+    """
+    Return a callable computing one reverse-mode Jacobian row.
+
+    The returned CPU callable takes the primal arguments followed by a
+    zero-based output-row index and returns one derivative per input.
+
+    Parameters
+    ----------
+    func : callable
+        An annotated CPU function returning a scalar or fixed homogeneous
+        tuple.
+
+    Returns
+    -------
+    callable
+        A host callable ``(*args, row)`` returning the selected Jacobian row.
+
+    See Also
+    --------
+    jacrev : The complete reverse-mode Jacobian.
+    vjp : A reverse-mode product with an arbitrary output cotangent.
+    jacfwd_column : The corresponding forward-mode column operation.
+    """
+    return load(build(func)).jacrev_row
+
+
 def jacfwd(func: Callable) -> Callable:
     """
     Return a callable computing a whole forward-mode Jacobian.
@@ -280,8 +370,11 @@ class Differentiable:
     # so decorating stays free until a derivative is actually asked for.
     grad = _cached_transform(grad)
     jvp = _cached_transform(jvp)
+    vjp = _cached_transform(vjp)
     jacfwd = _cached_transform(jacfwd)
     jacfwd_column = _cached_transform(jacfwd_column)
+    jacrev = _cached_transform(jacrev)
+    jacrev_row = _cached_transform(jacrev_row)
 
 
 def differentiable(func: Callable) -> Differentiable:
