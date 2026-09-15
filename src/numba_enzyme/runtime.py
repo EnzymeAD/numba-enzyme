@@ -27,6 +27,7 @@ Examples
 """
 
 import ctypes
+import operator
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -56,6 +57,13 @@ class Differentiable:
         `tuple` of `n_args` primal values and a `tuple` of `n_args`
         tangent values, and returns a single `float`; raises
         `TypeError` if either tuple has the wrong length.
+    jacfwd : callable
+        Computes the full forward-mode Jacobian. Takes `n_args` positional
+        arguments and returns a derivative tuple for a scalar result or an
+        output-by-input tuple matrix for a vector result.
+    jacfwd_column : callable
+        Computes one forward-mode Jacobian column. Takes `n_args` primal values
+        followed by a column index and returns a scalar or output tuple.
     n_args : int
         Number of scalar arguments the underlying function takes.
     n_outputs : int
@@ -78,8 +86,94 @@ class Differentiable:
 
     grad: Callable[..., tuple[float, ...]]
     jvp: Callable[[tuple[float, ...], tuple[float, ...]], float | tuple[float, ...]]
+    jacfwd: Callable[..., tuple]
+    jacfwd_column: Callable[..., float | tuple[float, ...]]
     n_args: int
     n_outputs: int
+
+
+def _unit(length: int, index: int) -> tuple[float, ...]:
+    """
+    Build the one-hot seed selecting a single Jacobian row or column.
+
+    Parameters
+    ----------
+    length : int
+        Number of components in the seed.
+    index : int
+        Zero-based position of the single non-zero component.
+
+    Returns
+    -------
+    tuple of float
+        `length` values, all zero but the one at `index`.
+
+    See Also
+    --------
+    load : Seeds the derivative callables it builds with this.
+
+    Examples
+    --------
+    >>> from numba_enzyme.runtime import _unit
+    >>> _unit(3, 1)
+    (0.0, 1.0, 0.0)
+    """
+    return tuple(1.0 if position == index else 0.0 for position in range(length))
+
+
+def _split_index(args, n_args: int, limit: int, kind: str, noun: str):
+    """
+    Split primal values from a trailing row or column index.
+
+    Parameters
+    ----------
+    args : tuple
+        The primal values followed by exactly one index.
+    n_args : int
+        Number of primal values expected.
+    limit : int
+        Exclusive upper bound on the index.
+    kind : str
+        What the index selects, ``"row"`` or ``"column"``, for error messages.
+    noun : str
+        What `limit` counts, for error messages.
+
+    Returns
+    -------
+    xs : tuple of float
+        The primal values.
+    index : int
+        The validated index.
+
+    Raises
+    ------
+    TypeError
+        If the argument count is wrong or the index is not integral.
+    IndexError
+        If the index is out of range.
+
+    See Also
+    --------
+    _unit : Turns the returned index into a seed.
+
+    Examples
+    --------
+    >>> from numba_enzyme.runtime import _split_index
+    >>> _split_index((2.0, 3.0, 1), 2, 2, "column", "arguments")
+    ((2.0, 3.0), 1)
+    """
+    if len(args) != n_args + 1:
+        raise TypeError(
+            f"expected {n_args} primal arguments and one {kind} index, got {len(args)}"
+        )
+    *xs, index = args
+    try:
+        index = operator.index(index)
+    except TypeError:
+        raise TypeError(f"{kind} index must be an integer") from None
+    if not 0 <= index < limit:
+        raise IndexError(f"{kind} index {index} is out of range for {limit} {noun}")
+    return tuple(xs), index
 
 
 def load(built: BuiltKernel) -> Differentiable:
@@ -273,9 +367,85 @@ def load(built: BuiltKernel) -> Differentiable:
             raise TypeError(f"expected {n} arguments, got {len(xs)}")
         return vjp(xs, 1.0)
 
+    def jacfwd(*xs: float) -> tuple:
+        """
+        Compute the full forward-mode Jacobian.
+
+        Parameters
+        ----------
+        *xs : float
+            The point to differentiate at, one value per primal argument.
+
+        Returns
+        -------
+        tuple
+            For a scalar output, one partial derivative per primal argument.
+            For vector output, an output-by-input tuple matrix.
+
+        Raises
+        ------
+        TypeError
+            If the number of arguments given doesn't match `n`.
+
+        Examples
+        --------
+        >>> from numba_enzyme.build import build
+        >>> from numba_enzyme.runtime import load
+        >>> from numba_enzyme.types import Float64
+        >>> def f(x: Float64) -> Float64:
+        ...     return x * x
+        >>> load(build(f)).jacfwd(2.0)  # doctest: +SKIP
+        (4.0,)
+        """
+        if len(xs) != n:
+            raise TypeError(f"expected {n} arguments, got {len(xs)}")
+        columns = tuple(jvp(xs, _unit(n, column)) for column in range(n))
+        if m == 1:
+            return columns
+        return tuple(
+            tuple(columns[column][row] for column in range(n)) for row in range(m)
+        )
+
+    def jacfwd_column(*args: float) -> float | tuple[float, ...]:
+        """
+        Compute one column of the forward-mode Jacobian.
+
+        Parameters
+        ----------
+        *args : float
+            The primal values followed by a zero-based integer column index.
+
+        Returns
+        -------
+        float or tuple of float
+            The partial derivative for the selected input column. A
+            vector-output function returns one value per output component.
+
+        Raises
+        ------
+        TypeError
+            If the number of arguments is wrong or the index is not integral.
+        IndexError
+            If the column index is out of range.
+
+        Examples
+        --------
+        >>> from numba_enzyme.build import build
+        >>> from numba_enzyme.runtime import load
+        >>> from numba_enzyme.types import Float64
+        >>> def f(x: Float64) -> Float64:
+        ...     return x * x
+        >>> load(build(f)).jacfwd_column(2.0, 0)  # doctest: +SKIP
+        4.0
+        """
+        xs, column = _split_index(args, n, n, "column", "arguments")
+        return jvp(xs, _unit(n, column))
+
     return Differentiable(
         grad=grad,
         jvp=jvp,
+        jacfwd=jacfwd,
+        jacfwd_column=jacfwd_column,
         n_args=n,
         n_outputs=m,
     )

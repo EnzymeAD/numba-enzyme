@@ -85,6 +85,11 @@ def test_vector_output_forward_derivatives():
     assert diff.jvp((x, y), (0.25, -0.5)) == pytest.approx(
         (y * 0.25 + x * -0.5, 2 * x * 0.25 - 0.5), abs=1e-9
     )
+    jacobian = diff.jacfwd(x, y)
+    assert jacobian[0] == pytest.approx((y, x), abs=1e-9)
+    assert jacobian[1] == pytest.approx((2 * x, 1.0), abs=1e-9)
+    assert diff.jacfwd_column(x, y, 0) == pytest.approx((y, 2 * x), abs=1e-9)
+    assert diff.jacfwd_column(x, y, 1) == pytest.approx((x, 1.0), abs=1e-9)
 
 
 def test_vector_output_rejects_grad():
@@ -96,4 +101,6 @@ def test_vector_output_rejects_grad():
 
 def test_float32_vector_output_uses_float32_runtime_abi():
     diff = load(build(f_vector32))
-    assert diff.jvp((1.25, 0.75), (1.0, 0.0)) == pytest.approx((0.75, 1.0), abs=1e-6)
+    jacobian = diff.jacfwd(1.25, 0.75)
+    assert jacobian[0] == pytest.approx((0.75, 1.25), abs=1e-6)
+    assert jacobian[1] == pytest.approx((1.0, 1.0), abs=1e-6)

@@ -14,6 +14,8 @@ def test_import():
 def test_public_derivative_api_is_exported():
     expected = {
         "grad",
+        "jacfwd",
+        "jacfwd_column",
         "jvp",
     }
     assert expected <= set(numba_enzyme.__all__)

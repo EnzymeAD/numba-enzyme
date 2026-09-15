@@ -33,6 +33,8 @@ from numba_enzyme.core import (
     Differentiable,
     differentiable,
     grad,
+    jacfwd,
+    jacfwd_column,
     jvp,
 )
 
@@ -42,5 +44,7 @@ __all__ = [
     "Differentiable",
     "differentiable",
     "grad",
+    "jacfwd",
+    "jacfwd_column",
     "jvp",
 ]

@@ -107,6 +107,76 @@ def jvp(func: Callable) -> Callable:
     return load(build(func)).jvp
 
 
+def jacfwd(func: Callable) -> Callable:
+    """
+    Return a callable computing a whole forward-mode Jacobian.
+
+    For an annotated CPU function, the returned callable takes the same
+    positional arguments as `func`. A scalar result produces one partial
+    derivative per argument as a `tuple`::
+
+        def f(x: Float64, y: Float64) -> Float64:
+            return x * y
+
+        jacfwd(f)(2.0, 3.0)  # (3.0, 2.0)
+
+    A fixed-size homogeneous tuple result produces an output-by-input tuple
+    matrix.
+
+    Parameters
+    ----------
+    func : callable
+        An annotated function returning a scalar or fixed homogeneous tuple.
+
+    Returns
+    -------
+    callable
+        A host callable ``(*args)`` returning the Jacobian as a tuple or tuple
+        matrix.
+
+    See Also
+    --------
+    jacfwd_column : One column of the same Jacobian, chosen at run time.
+    jvp : Forward derivative of a scalar-output primal.
+    """
+    return load(build(func)).jacfwd
+
+
+def jacfwd_column(func: Callable) -> Callable:
+    """
+    Return a callable computing one forward-mode Jacobian column.
+
+    For an annotated CPU function, the returned callable takes the primal
+    arguments followed by the zero-based column index. It returns the selected
+    partial derivative for a scalar result::
+
+        def f(x: Float64, y: Float64) -> Float64:
+            return x * y
+
+        jacfwd_column(f)(2.0, 3.0, 1)  # 2.0
+
+    For a fixed-size homogeneous tuple result it returns that column as a
+    tuple, with one derivative per output component.
+
+    Parameters
+    ----------
+    func : callable
+        An annotated function returning a scalar or fixed homogeneous tuple.
+
+    Returns
+    -------
+    callable
+        A host callable ``(*args, index)`` returning one scalar or tuple
+        column.
+
+    See Also
+    --------
+    jacfwd : The whole Jacobian, one sweep per column.
+    jvp : Forward derivative of a scalar-output primal.
+    """
+    return load(build(func)).jacfwd_column
+
+
 def _cached_transform(transform: Callable) -> functools.cached_property:
     """
     Build a `Differentiable` attribute applying one transformation.
@@ -210,6 +280,8 @@ class Differentiable:
     # so decorating stays free until a derivative is actually asked for.
     grad = _cached_transform(grad)
     jvp = _cached_transform(jvp)
+    jacfwd = _cached_transform(jacfwd)
+    jacfwd_column = _cached_transform(jacfwd_column)
 
 
 def differentiable(func: Callable) -> Differentiable:

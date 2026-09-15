@@ -39,6 +39,9 @@ def test_load_derivatives_match_analytic():
     got_jvp_y = diff.jvp((x, y), (0.0, 1.0))
     assert got_jvp_x == pytest.approx(expected_grad[0], abs=1e-9)
     assert got_jvp_y == pytest.approx(expected_grad[1], abs=1e-9)
+    assert diff.jacfwd(x, y) == pytest.approx(expected_grad, abs=1e-9)
+    assert diff.jacfwd_column(x, y, 0) == pytest.approx(expected_grad[0], abs=1e-9)
+    assert diff.jacfwd_column(x, y, 1) == pytest.approx(expected_grad[1], abs=1e-9)
 
 
 def test_grad_rejects_wrong_arity():
@@ -57,3 +60,21 @@ def test_jvp_rejects_wrong_arity():
     diff = load(build(f))
     with pytest.raises(TypeError):
         diff.jvp((1.0, 2.0), (1.0,))
+
+
+def test_jacfwd_rejects_wrong_arity():
+    diff = load(build(f))
+    with pytest.raises(TypeError, match="expected 2 arguments"):
+        diff.jacfwd(1.0)
+
+
+def test_jacfwd_column_validates_arguments_and_index():
+    diff = load(build(f))
+    with pytest.raises(TypeError, match="2 primal arguments"):
+        diff.jacfwd_column(1.0, 0)
+    with pytest.raises(TypeError, match="must be an integer"):
+        diff.jacfwd_column(1.0, 2.0, 0.5)
+    with pytest.raises(IndexError, match="out of range"):
+        diff.jacfwd_column(1.0, 2.0, 2)
+    with pytest.raises(IndexError, match="out of range"):
+        diff.jacfwd_column(1.0, 2.0, -1)
