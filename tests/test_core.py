@@ -1,13 +1,14 @@
-"""
-Tests for core.py: the @differentiable decorator and grad()/jvp() public
-API.
-"""
+"""Tests for core.py's public differentiation API."""
 
 import math
 
 import pytest
 
-from numba_enzyme.core import differentiable, grad, jvp
+from numba_enzyme.core import (
+    differentiable,
+    grad,
+    jvp,
+)
 from numba_enzyme.types import Float64
 
 
@@ -17,6 +18,10 @@ def f(x: Float64, y: Float64) -> Float64:
 
 def f_grad(x, y):
     return (math.cos(x) * y + y * y, math.sin(x) + 2 * x * y)
+
+
+def f_vector(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x * x + y
 
 
 # Decorated at module level -- must stay cheap (no build triggered by
@@ -46,12 +51,17 @@ def test_jvp_matches_analytic():
     assert j((x, y), (0.0, 1.0)) == pytest.approx(expected[1], abs=1e-9)
 
 
+def test_grad_rejects_vector_output():
+    with pytest.raises(TypeError, match="grad requires a scalar-output function"):
+        grad(f_vector)
+
+
 def test_differentiable_wrapper_calls_original_function():
     x, y = 1.3, 0.7
     assert f_decorated(x, y) == f(x, y)
 
 
-def test_differentiable_wrapper_exposes_grad_and_jvp():
+def test_differentiable_wrapper_exposes_all_derivative_modes():
     x, y = 1.3, 0.7
     expected = f_grad(x, y)
     assert f_decorated.grad(x, y) == pytest.approx(expected, abs=1e-9)

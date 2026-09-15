@@ -19,13 +19,17 @@ pip install numba-enzyme
 ## Usage
 
 Arguments of the function must be annotated by the `numba_enzyme.types`. This is required to compile
-the function to a Numba `cfunc`. Then use `grad`, `jvp` and pass the inputs. Also you can decorate
-your function `f` with `@differentiable`, and call `f.grad` or `f.jvp` to get the gradient or
-Jacobian-vector product, respectively.
+the function to a Numba `cfunc`. Then use `grad` or `jvp` and pass the
+inputs. You can also decorate your function `f`
+with `@differentiable` to expose each operation as an attribute.
 
 ```python
-import math # import numpy as np
-from numba_enzyme.core import grad, jvp, differentiable
+import math  # import numpy as np
+from numba_enzyme import (
+    differentiable,
+    grad,
+    jvp,
+)
 from numba_enzyme.types import Float64
 
 def f(x: Float64, y: Float64) -> Float64:
@@ -34,6 +38,12 @@ def f(x: Float64, y: Float64) -> Float64:
 
 grad(f)(1.0, 2.0)               # -> (df/dx, df/dy)
 jvp(f)((1.0, 2.0), (1.0, 0.0))  # -> directional derivative along (1.0, 0.0)
+
+def f_vec(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x * x + y
+
+jvp(f_vec)((1.0, 2.0), (1.0, 0.0))  # -> (2.0, 2.0), one tangent per output
+
 
 @differentiable
 def g(x: Float64, y: Float64) -> Float64:
@@ -45,10 +55,22 @@ g.grad(1.0, 2.0)      # reverse-mode gradient, built lazily on first access
 g.jvp((1.0, 2.0), (1.0, 0.0))  # forward-mode JVP
 ```
 
+`grad` requires its target function to return exactly one scalar. It does not
+accept tuple-valued targets. `jvp` handles both scalar and vector outputs.
+Vector outputs use fixed-size homogeneous tuples.
+
+### Choosing a differentiation operation
+
+| API | Mode | Result and typical use |
+|---|---|---|
+| `grad` | Reverse | Gradient of a **single scalar output** in one reverse sweep. Prefer this for scalar losses, particularly with many inputs. |
+| `jvp` | Forward | Jacobian-vector product `J @ tangent` without constructing the Jacobian. Use it for a known input direction. |
 
 ### Scope
-* It is still not possible to mark the arguments as active or conastant.
-* The arguments and the return value can be of scalar type only at the moment.
+
+* It is still not possible to mark the arguments as active or constant.
+* CPU arguments must be scalar; results may be scalar or fixed-size homogeneous
+  tuples of scalars. General array inputs and outputs are not yet supported.
 * Linear algebra e.g. `np.dot`, `np.linalg.norm` etc are not supported.
 
 ## License

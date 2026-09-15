@@ -36,7 +36,8 @@ _CFUNC_PREFIX = "cfunc."
 _EXPECTED_EXCINFO_TYPE = "{ i8*, i32, i8*, i8*, i32 }**"
 
 # LLVM textual type for each scalar numba type this package accepts as
-# an annotation (see numba_enzyme.types).
+# an annotation (see numba_enzyme.types). CPU vector outputs are represented
+# by fixed-size homogeneous tuples of these scalar types.
 # TODO: expand for other scalar types and arrays
 _LLVM_SCALAR_TYPE = {
     nb.types.float64: "double",
@@ -85,6 +86,11 @@ class LoweredKernel:
         The mangled name of the retptr/excinfo-ABI entry point.
     n_args : int
         Number of scalar arguments `entry_symbol` takes.
+    n_outputs : int
+        Number of scalar results. One denotes a scalar return; larger values
+        denote a fixed-size homogeneous tuple return.
+    return_type : str
+        LLVM textual type of one result component.
     arg_types : tuple of str
         The entry point's real LLVM parameter types in order: the
         output pointer, the exception-info pointer, then `n_args`
@@ -107,6 +113,8 @@ class LoweredKernel:
     ir: str
     entry_symbol: str
     n_args: int
+    n_outputs: int
+    return_type: str
     arg_types: tuple[str, ...]
 
 
@@ -179,21 +187,67 @@ def _llvm_scalar_type(numba_type: nb.types.Type) -> str:
         ) from None
 
 
+def _numba_return_type(annotation) -> tuple[nb.types.Type, nb.types.Type, int]:
+    """
+    Resolve a scalar or fixed homogeneous tuple return annotation.
+
+    Parameters
+    ----------
+    annotation : object
+        Evaluated Python return annotation.
+
+    Returns
+    -------
+    return_type : numba.core.types.Type
+        Complete Numba return type used to compile the function.
+    scalar_type : numba.core.types.Type
+        Scalar component type stored in the return value.
+    n_outputs : int
+        Number of scalar output components.
+
+    Raises
+    ------
+    LoweringError
+        If the annotation is an empty, variadic, or heterogeneous tuple.
+    """
+    if typing.get_origin(annotation) is not tuple:
+        scalar_type = _numba_type_of(annotation)
+        _llvm_scalar_type(scalar_type)
+        return scalar_type, scalar_type, 1
+
+    annotations = typing.get_args(annotation)
+    if len(annotations) < 2:
+        raise LoweringError("tuple return annotation must contain at least two types")
+    if Ellipsis in annotations:
+        raise LoweringError("tuple return annotation must have a fixed size")
+
+    scalar_types = tuple(_numba_type_of(item) for item in annotations)
+    for scalar_type in scalar_types:
+        _llvm_scalar_type(scalar_type)
+    if any(scalar_type != scalar_types[0] for scalar_type in scalar_types[1:]):
+        raise LoweringError("tuple return annotation must be homogeneous")
+
+    n_outputs = len(scalar_types)
+    scalar_type = scalar_types[0]
+    return nb.types.UniTuple(scalar_type, n_outputs), scalar_type, n_outputs
+
+
 def lower(func: Callable) -> LoweredKernel:
     """
     Compile a Python function to a validated `LoweredKernel`.
 
-    Reads `func`'s parameter and return type annotations (each must be
-    a `numba_enzyme.types` class) to build the Numba signature, compiles
-    it with :func:`numba.cfunc`, then locates and validates the
-    resulting retptr/excinfo entry point.
+    Reads `func`'s parameter and return type annotations to build the Numba
+    signature. Parameters must use `numba_enzyme.types` classes; the return may
+    also be a fixed-size homogeneous tuple of those classes. It compiles the
+    function with :func:`numba.cfunc`, then locates and validates the resulting
+    retptr/excinfo entry point.
 
     Parameters
     ----------
     func : callable
-        A Python function whose parameters and return value are each
-        annotated with a `numba_enzyme.types` class, e.g.
-        ``def f(x: Float64) -> Float64: ...``.
+        A Python function whose scalar parameters use `numba_enzyme.types`
+        annotations and whose return is a scalar or fixed homogeneous tuple of
+        those types.
 
     Returns
     -------
@@ -203,9 +257,9 @@ def lower(func: Callable) -> LoweredKernel:
     Raises
     ------
     LoweringError
-        If `func` is missing a type annotation, uses an unsupported
-        type, or Numba's emitted IR doesn't match the expected
-        retptr/excinfo entry-point shape.
+        If `func` is missing a type annotation, uses an unsupported type, or
+        Numba's emitted IR doesn't match the expected retptr/excinfo entry-point
+        shape.
 
     See Also
     --------
@@ -225,7 +279,7 @@ def lower(func: Callable) -> LoweredKernel:
 
     try:
         arg_numba_types = [_numba_type_of(hints[name]) for name in params]
-        ret_numba_type = _numba_type_of(hints["return"])
+        ret_numba_type, ret_scalar_type, n_outputs = _numba_return_type(hints["return"])
     except KeyError as exc:
         raise LoweringError(
             f"{func!r} is missing a type annotation for {exc.args[0]!r}"
@@ -260,7 +314,10 @@ def lower(func: Callable) -> LoweredKernel:
 
     retptr, excinfo, *scalar_args = args
 
-    expected_retptr_type = _llvm_scalar_type(ret_numba_type) + "*"
+    return_type = _llvm_scalar_type(ret_scalar_type)
+    expected_retptr_type = (
+        return_type + "*" if n_outputs == 1 else f"[{n_outputs} x {return_type}]*"
+    )
     if retptr.name != "retptr" or str(retptr.type) != expected_retptr_type:
         raise LoweringError(
             f"expected first parameter 'retptr: {expected_retptr_type}', "
@@ -280,5 +337,10 @@ def lower(func: Callable) -> LoweredKernel:
 
     arg_types = tuple(str(a.type) for a in args)
     return LoweredKernel(
-        ir=ir_text, entry_symbol=entry_symbol, n_args=n_args, arg_types=arg_types
+        ir=ir_text,
+        entry_symbol=entry_symbol,
+        n_args=n_args,
+        n_outputs=n_outputs,
+        return_type=return_type,
+        arg_types=arg_types,
     )
