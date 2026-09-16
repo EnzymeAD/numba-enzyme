@@ -129,6 +129,7 @@ class CUDABuiltKernel:
     shape: str
     path: Path
     from_cache: bool
+    n_dirs: int = 1
 
 
 @dataclass(frozen=True)
@@ -757,10 +758,18 @@ MODES = (
 )
 
 # Forward Jacobians need a primal with several outputs, which means a
-# tuple-returning one. Reverse products also accept a scalar return.
-SCALAR_ONLY_MODES = frozenset({"grad", "jvp"})
+# tuple-returning one. Reverse products also accept a scalar return, and so
+# does `jvp`: a scalar primal's directional derivative is a scalar, a
+# tuple-returning one's is the whole tangent vector, and both are one sweep.
+# `jvp` also composes with itself -- `jvp(jvp(f))` is the second-order
+# directional derivative -- but only for a tuple-returning primal, because only
+# the array call shape can carry the extra direction sets.
+SCALAR_ONLY_MODES = frozenset({"grad"})
 TUPLE_ONLY_MODES = frozenset({"jacfwd", "jacfwd_column"})
+TUPLE_FORWARD_MODES = frozenset({"jacfwd", "jacfwd_column", "jvp"})
 REVERSE_MODES = frozenset({"vjp", "jacrev", "jacrev_row"})
+# What `modes=None` means: the original scalar-return defaults.
+DEFAULT_MODES = frozenset({"grad", "jvp"})
 
 # Leading array arguments of each tuple-primal call shape, before the primal's
 # scalars, and whether a row or column selector follows them. A tuple-returning
@@ -768,16 +777,29 @@ REVERSE_MODES = frozenset({"vjp", "jacrev", "jacrev_row"})
 # buffer cross the call: forward modes take Enzyme's tangent struct directly,
 # and reverse modes seed a scalarised primal whose return is the
 # cotangent-weighted sum of the outputs.
+# ``(leading, selector, directions)``: leading array arguments before the
+# primal's own, whether a row/column selector trails them, and how many further
+# copies of the primal's argument list follow as direction vectors. A direction
+# set mirrors the primal's arguments exactly -- an array where the primal takes
+# a tuple, a scalar where it takes a scalar -- so a seed never has to be
+# materialised in a shape the caller does not already have.
 _TUPLE_CALL_LAYOUT = {
-    "jacfwd": (1, False),  # (jacobian, *args)
-    "jacfwd_column": (1, True),  # (column, *args, index)
-    "vjp": (2, False),  # (cotangent, gradient, *args)
-    "jacrev": (1, False),  # (jacobian, *args)
-    "jacrev_row": (1, True),  # (gradient, *args, row)
+    "jacfwd": (1, False, 0),  # (jacobian, *args)
+    "jacfwd_column": (1, True, 0),  # (column, *args, index)
+    "jvp": (1, False, 1),  # (tangent, *args, *directions); see _call_arities
+    "vjp": (2, False, 0),  # (cotangent, gradient, *args)
+    "jacrev": (1, False, 0),  # (jacobian, *args)
+    "jacrev_row": (1, True, 0),  # (gradient, *args, row)
 }
 
 
-def _call_arities(mode, n_params):
+# How many direction sets a `jvp` call site may supply. The placeholder is
+# generated wide enough for this many, and each count has its own arity, which
+# is how a call site says how many sweeps it wants.
+_MAX_DIRECTIONS = 8
+
+
+def _call_arities(mode, n_params, n_dirs=1):
     """
     Return how many arguments a call to `mode` takes for each primal shape.
 
@@ -803,8 +825,13 @@ def _call_arities(mode, n_params):
         scalar = {"jvp": 2, "vjp": 2, "jacrev_row": n_params + 1}
         arities["scalar"] = scalar.get(mode, n_params)
     if mode not in SCALAR_ONLY_MODES:
-        leading, selector = _TUPLE_CALL_LAYOUT[mode]
-        arities["tuple"] = leading + n_params + int(selector)
+        leading, selector, directions = _TUPLE_CALL_LAYOUT[mode]
+        # Each composition level differentiates the level below with respect to
+        # *all* of its arguments, so it takes a direction per argument and the
+        # level's own argument list doubles: 2**(depth - 1) copies of the
+        # primal's. A directional endpoint then adds a seed of that same width.
+        sets = n_dirs if directions else 0
+        arities["tuple"] = leading + n_params * (1 + sets) + int(selector)
     return arities
 
 
@@ -829,11 +856,10 @@ def _call_parameters(mode, n_params):
     --------
     _call_arities : The call shapes these parameters cover.
     """
-    arities = _call_arities(mode, n_params).values()
-    required = min(arities)
+    required = min(_call_arities(mode, n_params, 1).values())
+    widest = max(_call_arities(mode, n_params, _MAX_DIRECTIONS).values())
     return tuple(
-        f"a{index}" if index < required else f"a{index}=None"
-        for index in range(max(arities))
+        f"a{index}" if index < required else f"a{index}=None" for index in range(widest)
     )
 
 
@@ -859,7 +885,7 @@ def _normalise_modes(modes) -> frozenset:
     """
 
     if modes is None:
-        return SCALAR_ONLY_MODES
+        return DEFAULT_MODES
     requested = frozenset(modes)
     unknown = requested - frozenset(MODES)
     if unknown:
@@ -910,7 +936,10 @@ _SCALAR_REVERSE_ENTRIES = {
 
 
 def synthesise_cuda(
-    kernel: CUDALoweredKernel, symbol_suffix: str, modes=None
+    kernel: CUDALoweredKernel,
+    symbol_suffix: str,
+    modes=None,
+    n_dirs=1,
 ) -> CUDASynthesisedDriver:
     """
     Build C-ABI device wrappers containing Enzyme marker calls.
@@ -946,7 +975,7 @@ def synthesise_cuda(
     shape = _primal_shape(kernel.return_type)
     _validate_modes_for_shape(requested, shape)
     if shape == "tuple":
-        return _synthesise_cuda_tuple(kernel, symbol_suffix, requested, module)
+        return _synthesise_cuda_tuple(kernel, symbol_suffix, requested, module, n_dirs)
 
     scalar_type = _SCALAR_IR_TYPE[str(kernel.return_type)]
     n_args = len(kernel.arg_types)
@@ -1148,7 +1177,11 @@ def _declare_entry_point(module, name, params, selector=None):
 
 
 def _synthesise_cuda_tuple(
-    kernel: CUDALoweredKernel, symbol_suffix: str, requested, module
+    kernel: CUDALoweredKernel,
+    symbol_suffix: str,
+    requested,
+    module,
+    n_dirs=1,
 ) -> CUDASynthesisedDriver:
     """
     Build the derivative entry points for a tuple-returning primal.
@@ -1196,9 +1229,6 @@ def _synthesise_cuda_tuple(
     result_type = (
         scalar_type if n_out == 1 else ir.LiteralStructType([scalar_type] * n_out)
     )
-    gradient_type = (
-        scalar_type if n_args == 1 else ir.LiteralStructType([scalar_type] * n_args)
-    )
     one = ir.Constant(scalar_type, 1.0)
     zero = ir.Constant(scalar_type, 0.0)
 
@@ -1211,34 +1241,19 @@ def _synthesise_cuda_tuple(
     enzyme_const.linkage = "external"
 
     fwddiff = None
-    if requested & TUPLE_ONLY_MODES:
+    # Inner composition levels are forward sweeps whatever the endpoint is, so
+    # a reverse endpoint over a jvp still needs the forward marker declared.
+    if requested & TUPLE_FORWARD_MODES:
         fwddiff = ir.Function(
             module,
             ir.FunctionType(result_type, [i8p], var_arg=True),
             name="__enzyme_fwddiff",
         )
 
-    autodiff = None
-    scalarised = None
-    if requested & REVERSE_MODES:
-        autodiff = ir.Function(
-            module,
-            ir.FunctionType(gradient_type, [i8p], var_arg=True),
-            name="__enzyme_autodiff",
-        )
-        scalarised = ir.Function(
-            module,
-            ir.FunctionType(scalar_type, scalar_types + [scalar_type] * n_out),
-            name=f"numba_enzyme_scalarised_{symbol_suffix}",
-        )
-        scalarised.linkage = "internal"
-        body = ir.IRBuilder(scalarised.append_basic_block("entry"))
-        values = body.call(primal_fn, scalarised.args[:n_args])
-        total = zero
-        for index in range(n_out):
-            output = values if n_out == 1 else body.extract_value(values, index)
-            total = body.fadd(total, body.fmul(scalarised.args[n_args + index], output))
-        body.ret(total)
+    # Enzyme matches its markers by name *prefix*, so one declaration per
+    # differentiated arity can coexist; a composition level changes that arity.
+    scalarisations = {}
+    reverse_markers = {}
 
     def component(builder, aggregate, count, index):
         """Return field `index` of an aggregate, or the value if it is scalar."""
@@ -1250,10 +1265,10 @@ def _synthesise_cuda_tuple(
             builder.bitcast(descriptor[1], scalar_ptr), [descriptor[2]], inbounds=True
         )
 
-    def forward(builder, xs, column):
+    def forward(builder, callee, xs, column):
         """Emit one forward sweep seeding argument `column`; return the tangent."""
         dup = builder.load(enzyme_dup)
-        call_args = [builder.bitcast(primal_fn, i8p)]
+        call_args = [builder.bitcast(callee, i8p)]
         for index, primal in enumerate(xs):
             seed = builder.select(
                 builder.icmp_signed("==", column, ir.Constant(i32, index)), one, zero
@@ -1261,21 +1276,75 @@ def _synthesise_cuda_tuple(
             call_args.extend([dup, primal, seed])
         return builder.call(fwddiff, call_args)
 
-    def reverse(builder, xs, weights):
-        """Emit one reverse sweep of the scalarisation; return the gradient."""
+    def seeded(builder, callee, xs, seeds):
+        """Emit one forward sweep of `callee` with caller-supplied seeds.
+
+        `forward` builds a unit seed per sweep, which is all a Jacobian column
+        needs; a directional derivative wants an arbitrary seed. `callee` is
+        the primal at depth one and the level below at any greater depth.
+        """
+        dup = builder.load(enzyme_dup)
+        call_args = [builder.bitcast(callee, i8p)]
+        for primal, seed in zip(xs, seeds):
+            call_args.extend([dup, primal, seed])
+        return builder.call(fwddiff, call_args)
+
+    def scalarise(callee, count, outputs):
+        """``g(x, w) = sum_k w_k * callee(x)_k``, the primal a reverse sweep seeds.
+
+        Enzyme does not accept an aggregate differential return on
+        ``__enzyme_autodiff``, so a multi-output function is differentiated
+        through this weighted sum instead; one sweep then returns ``w @ J``.
+        """
+        existing = scalarisations.get(callee.name)
+        if existing is not None:
+            # Several reverse endpoints over the same level share one.
+            return existing
+        fn = ir.Function(
+            module,
+            ir.FunctionType(scalar_type, [scalar_type] * (count + outputs)),
+            name=f"numba_enzyme_scalarised_{symbol_suffix}",
+        )
+        fn.linkage = "internal"
+        body = ir.IRBuilder(fn.append_basic_block("entry"))
+        values = body.call(callee, fn.args[:count])
+        total = zero
+        for index in range(outputs):
+            field = values if outputs == 1 else body.extract_value(values, index)
+            total = body.fadd(total, body.fmul(fn.args[count + index], field))
+        body.ret(total)
+        scalarisations[callee.name] = fn
+        return fn
+
+    def reverse(builder, callee, count, outputs, xs, weights):
+        """Emit one reverse sweep of `callee`'s scalarisation; return the gradient."""
+        marker = reverse_markers.get(count)
+        if marker is None:
+            marker = ir.Function(
+                module,
+                ir.FunctionType(
+                    scalar_type
+                    if count == 1
+                    else ir.LiteralStructType([scalar_type] * count),
+                    [i8p],
+                    var_arg=True,
+                ),
+                name=f"__enzyme_autodiff_{count}",
+            )
+            reverse_markers[count] = marker
         const = builder.load(enzyme_const)
-        call_args = [builder.bitcast(scalarised, i8p), *xs]
+        call_args = [builder.bitcast(scalarise(callee, count, outputs), i8p), *xs]
         for weight in weights:
             call_args.extend([const, weight])
-        return builder.call(autodiff, call_args)
+        return builder.call(marker, call_args)
 
-    def unit_weights(builder, selected):
+    def unit_weights(builder, selected, count):
         """Build the one-hot cotangent picking output `selected` (``i64``)."""
         return [
             builder.select(
                 builder.icmp_signed("==", selected, ir.Constant(i64, index)), one, zero
             )
-            for index in range(n_out)
+            for index in range(count)
         ]
 
     def flatten(builder, handles):
@@ -1305,21 +1374,48 @@ def _synthesise_cuda_tuple(
                 builder.gep(base, [offset], inbounds=True),
             )
 
-    def matrix_loop(entry_fn, handles, jac, bound, emit):
-        """Emit a do-while loop over `bound`, calling `emit(builder, k, base, xs)`."""
+    def store_slice(builder, aggregate, count, matrix, index, along_rows):
+        """Store an aggregate into one row or column of a two-dimensional memref.
+
+        A forward sweep fills a Jacobian *column* -- it is seeded by an input --
+        and a reverse sweep fills a *row*, seeded by an output; the two differ
+        only in which stride the sweep index multiplies.
+        """
+        base = memref_base(builder, matrix)
+        for position in range(count):
+            offset = ir.Constant(i64, position)
+            first, second = (index, offset) if along_rows else (offset, index)
+            location = builder.add(
+                builder.mul(first, matrix[5]), builder.mul(second, matrix[6])
+            )
+            builder.store(
+                component(builder, aggregate, count, position),
+                builder.gep(base, [location], inbounds=True),
+            )
+
+    def load_element(builder, matrix, row, column):
+        """Load one element of a two-dimensional memref."""
+        base = memref_base(builder, matrix)
+        location = builder.add(
+            builder.mul(row, matrix[5]),
+            builder.mul(ir.Constant(i64, column), matrix[6]),
+        )
+        return builder.load(builder.gep(base, [location], inbounds=True))
+
+    def sweep_loop(entry_fn, handles, bound, emit):
+        """Emit a do-while loop over `bound`, calling `emit(builder, k, xs)`."""
         entry_block = entry_fn.append_basic_block("entry")
         loop_block = entry_fn.append_basic_block("loop")
         exit_block = entry_fn.append_basic_block("exit")
         builder = ir.IRBuilder(entry_block)
-        base = memref_base(builder, jac)
         # The argument loads are loop-invariant, so they belong here rather
         # than in the body that runs one sweep per row or column.
-        xs = flatten(builder, handles)
+        xs = flatten_groups(builder, handles)
         builder.branch(loop_block)
         builder = ir.IRBuilder(loop_block)
         index = builder.phi(i64, name="k")
         index.add_incoming(ir.Constant(i64, 0), entry_block)
-        emit(builder, index, base, xs)
+        emit(builder, index, xs)
         following = builder.add(index, ir.Constant(i64, 1))
         index.add_incoming(following, builder.block)
         builder.cbranch(
@@ -1329,111 +1425,198 @@ def _synthesise_cuda_tuple(
 
     # The entry points mirror the primal's own argument list: a tuple argument
     # arrives as a contiguous array, a scalar argument as itself.
-    argument_params = [
-        ("scalar", f"x{position}", scalar_type)
-        if width is None
-        else ("array", f"x{position}", 1)
-        for position, width in enumerate(widths)
-    ]
+    def mirrored_params(prefix):
+        """One parameter per primal parameter, of the same kind."""
+        return [
+            ("scalar", f"{prefix}{position}", scalar_type)
+            if width is None
+            else ("array", f"{prefix}{position}", 1)
+            for position, width in enumerate(widths)
+        ]
+
+    argument_params = mirrored_params("x")
+    n_parameters = len(widths)
+
+    def flatten_groups(builder, handles):
+        """Flatten any number of mirrored argument groups into flat scalars."""
+        scalars = []
+        for start in range(0, len(handles), n_parameters):
+            scalars += flatten(builder, handles[start : start + n_parameters])
+        return scalars
+
+    level_fn, level_args = primal_fn, n_args
+    level_params = list(argument_params)
 
     symbols = {}
     if "jacfwd_column" in requested:
+        # (column, <level arguments>, index).
         symbol = f"numba_enzyme_jacfwdcol_{symbol_suffix}"
         entry_fn, (column_out, *arguments), selected = _declare_entry_point(
             module,
             symbol,
-            [("array", "column", 1), *argument_params],
+            [("array", "column", 1), *level_params],
             selector="column",
         )
         builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
-        xs = flatten(builder, arguments)
-        store_vector(builder, forward(builder, xs, selected), n_out, column_out)
+        xs = flatten_groups(builder, arguments)
+        store_vector(
+            builder, forward(builder, level_fn, xs, selected), n_out, column_out
+        )
         builder.ret_void()
         symbols["jacfwd_column"] = (symbol,)
 
+    if "jvp" in requested:
+        # (tangent, <level arguments>, <direction>): one sweep for the whole
+        # directional derivative, however many outputs the primal has. A
+        # Jacobian column is the special case of a unit direction, so a caller
+        # that wants J @ v pays one sweep rather than one per column.
+        symbol = f"numba_enzyme_jvp_{symbol_suffix}"
+        per_sweep = len(level_params) // n_parameters
+        entry_fn, (tangent_out, *arguments), _ = _declare_entry_point(
+            module,
+            symbol,
+            [
+                ("array", "tangent", 2 if n_dirs > 1 else 1),
+                *level_params,
+                *[
+                    parameter
+                    for sweep in range(n_dirs)
+                    for group in range(per_sweep)
+                    for parameter in mirrored_params(f"s{sweep}_{group}_")
+                ],
+            ],
+        )
+        builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
+        scalars = flatten_groups(builder, arguments)
+        values = scalars[:level_args]
+        for sweep in range(n_dirs):
+            start = level_args * (1 + sweep)
+            tangent = seeded(
+                builder, level_fn, values, scalars[start : start + level_args]
+            )
+            if n_dirs > 1:
+                store_slice(
+                    builder,
+                    tangent,
+                    n_out,
+                    tangent_out,
+                    ir.Constant(i64, sweep),
+                    along_rows=True,
+                )
+            else:
+                store_vector(builder, tangent, n_out, tangent_out)
+        builder.ret_void()
+        symbols["jvp"] = (symbol,)
+
     if "jacfwd" in requested:
-        # (jacobian, x0..xn): one forward sweep per column, straight into place.
+        # (jacobian, <level arguments>): one forward sweep per column.
         symbol = f"numba_enzyme_jacfwd_{symbol_suffix}"
         entry_fn, (jac, *arguments), _ = _declare_entry_point(
-            module, symbol, [("array", "jac", 2), *argument_params]
+            module, symbol, [("array", "jac", 2), *level_params]
         )
 
-        def fill_column(builder, column, base, xs):
-            tangent = forward(builder, xs, builder.trunc(column, i32))
-            for row in range(n_out):
-                location = builder.add(
-                    builder.mul(ir.Constant(i64, row), jac[5]),
-                    builder.mul(column, jac[6]),
-                )
-                builder.store(
-                    component(builder, tangent, n_out, row),
-                    builder.gep(base, [location], inbounds=True),
-                )
+        def fill_column(builder, column, xs):
+            tangent = forward(builder, level_fn, xs, builder.trunc(column, i32))
+            store_slice(builder, tangent, n_out, jac, column, along_rows=False)
 
-        matrix_loop(entry_fn, arguments, jac, jac[4], fill_column)
+        sweep_loop(entry_fn, arguments, jac[4], fill_column)
         symbols["jacfwd"] = (symbol,)
 
     if "vjp" in requested:
-        # (cotangent, gradient, x0..xn).
+        # (cotangent, gradient, <level arguments>).
         symbol = f"numba_enzyme_vjp_{symbol_suffix}"
+        rank = 2 if n_dirs > 1 else 1
         entry_fn, (cotangent, gradient, *arguments), _ = _declare_entry_point(
             module,
             symbol,
-            [("array", "cotangent", 1), ("array", "gradient", 1), *argument_params],
+            [
+                ("array", "cotangent", rank),
+                ("array", "gradient", rank),
+                *level_params,
+            ],
         )
-        builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
-        xs = flatten(builder, arguments)
-        source = memref_base(builder, cotangent)
-        weights = [
-            builder.load(
-                builder.gep(
-                    source,
-                    [builder.mul(ir.Constant(i64, index), cotangent[4])],
-                    inbounds=True,
+        if n_dirs > 1:
+            # A row of cotangents per sweep. The count is the array's own
+            # extent, so this is the same loop jacrev runs -- jacrev just
+            # supplies the identity instead of reading the rows.
+            def fill_row(builder, row, xs):
+                weights = [
+                    load_element(builder, cotangent, row, index)
+                    for index in range(n_out)
+                ]
+                store_slice(
+                    builder,
+                    reverse(builder, level_fn, level_args, n_out, xs, weights),
+                    level_args,
+                    gradient,
+                    row,
+                    along_rows=True,
                 )
+
+            sweep_loop(entry_fn, arguments, cotangent[3], fill_row)
+        else:
+            builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
+            xs = flatten_groups(builder, arguments)
+            source = memref_base(builder, cotangent)
+            weights = [
+                builder.load(
+                    builder.gep(
+                        source,
+                        [builder.mul(ir.Constant(i64, index), cotangent[4])],
+                        inbounds=True,
+                    )
+                )
+                for index in range(n_out)
+            ]
+            store_vector(
+                builder,
+                reverse(builder, level_fn, level_args, n_out, xs, weights),
+                level_args,
+                gradient,
             )
-            for index in range(n_out)
-        ]
-        store_vector(builder, reverse(builder, xs, weights), n_args, gradient)
-        builder.ret_void()
+            builder.ret_void()
         symbols["vjp"] = (symbol,)
 
     if "jacrev_row" in requested:
-        # (gradient, x0..xn, row).
+        # (gradient, <level arguments>, row).
         symbol = f"numba_enzyme_jacrevrow_{symbol_suffix}"
         entry_fn, (gradient, *arguments), selected = _declare_entry_point(
             module,
             symbol,
-            [("array", "gradient", 1), *argument_params],
+            [("array", "gradient", 1), *level_params],
             selector="row",
         )
         builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
-        xs = flatten(builder, arguments)
-        weights = unit_weights(builder, builder.sext(selected, i64))
-        store_vector(builder, reverse(builder, xs, weights), n_args, gradient)
+        xs = flatten_groups(builder, arguments)
+        weights = unit_weights(builder, builder.sext(selected, i64), n_out)
+        store_vector(
+            builder,
+            reverse(builder, level_fn, level_args, n_out, xs, weights),
+            level_args,
+            gradient,
+        )
         builder.ret_void()
         symbols["jacrev_row"] = (symbol,)
 
     if "jacrev" in requested:
-        # (jacobian, x0..xn): one reverse sweep per output row.
+        # (jacobian, <level arguments>): one reverse sweep per output row.
         symbol = f"numba_enzyme_jacrev_{symbol_suffix}"
         entry_fn, (jac, *arguments), _ = _declare_entry_point(
-            module, symbol, [("array", "jac", 2), *argument_params]
+            module, symbol, [("array", "jac", 2), *level_params]
         )
 
-        def fill_row(builder, row, base, xs):
-            gradient = reverse(builder, xs, unit_weights(builder, row))
-            for column in range(n_args):
-                location = builder.add(
-                    builder.mul(row, jac[5]),
-                    builder.mul(ir.Constant(i64, column), jac[6]),
-                )
-                builder.store(
-                    component(builder, gradient, n_args, column),
-                    builder.gep(base, [location], inbounds=True),
-                )
+        def fill_row(builder, row, xs):
+            gradient = reverse(
+                builder,
+                level_fn,
+                level_args,
+                n_out,
+                xs,
+                unit_weights(builder, row, n_out),
+            )
+            store_slice(builder, gradient, level_args, jac, row, along_rows=True)
 
-        matrix_loop(entry_fn, arguments, jac, jac[3], fill_row)
+        sweep_loop(entry_fn, arguments, jac[3], fill_row)
         symbols["jacrev"] = (symbol,)
 
     return CUDASynthesisedDriver(ir=str(module), modes=requested, symbols=symbols)
@@ -1480,7 +1663,9 @@ def _source_text(func) -> str:
         return repr((code.co_code, code.co_consts, code.co_names))
 
 
-def _cuda_cache_key(func, arg_types, return_type, cc, modes, kernel_ir) -> str:
+def _cuda_cache_key(
+    func, arg_types, return_type, cc, modes, kernel_ir, n_dirs=1
+) -> str:
     """
     Compute the cache key for a CUDA derivative specialization.
 
@@ -1510,6 +1695,7 @@ def _cuda_cache_key(func, arg_types, return_type, cc, modes, kernel_ir) -> str:
     options = getattr(func, "targetoptions", {})
     material = {
         "modes": sorted(modes),
+        "directions": n_dirs,
         "kernel_ir": kernel_ir,
         "source": _source_text(func),
         "qualname": func.py_func.__qualname__,
@@ -1528,7 +1714,7 @@ def _cuda_cache_key(func, arg_types, return_type, cc, modes, kernel_ir) -> str:
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
 
-def _device_signatures(arg_types, return_type, shape) -> dict:
+def _device_signatures(arg_types, return_type, shape, n_dirs=1) -> dict:
     """
     Construct public Numba signatures for the derivative device calls.
 
@@ -1567,12 +1753,16 @@ def _device_signatures(arg_types, return_type, shape) -> dict:
             supplied if width is not None else argument
             for argument, width in zip(arg_types, _argument_widths(arg_types))
         )
+        level = scalars
+        # One sweep writes a vector; several write a matrix, one slice each.
+        sweeps = matrix if n_dirs > 1 else array
         return {
-            "jacfwd": cuda_types.void(matrix, *scalars),
-            "jacfwd_column": cuda_types.void(array, *scalars, cuda_types.int32),
-            "vjp": cuda_types.void(array, array, *scalars),
-            "jacrev": cuda_types.void(matrix, *scalars),
-            "jacrev_row": cuda_types.void(array, *scalars, cuda_types.int32),
+            "jacfwd": cuda_types.void(matrix, *level),
+            "jacfwd_column": cuda_types.void(array, *level, cuda_types.int32),
+            "jvp": cuda_types.void(sweeps, *level, *(level * n_dirs)),
+            "vjp": cuda_types.void(sweeps, sweeps, *level),
+            "jacrev": cuda_types.void(matrix, *level),
+            "jacrev_row": cuda_types.void(array, *level, cuda_types.int32),
         }
     tuple_type = cuda_types.UniTuple(return_type, len(arg_types))
     return {
@@ -1781,7 +1971,7 @@ def _resolve_specialization(func, signature, cc, modes):
     )
 
 
-def build_cuda(func, signature=None, cc=None, modes=None) -> CUDABuiltKernel:
+def build_cuda(func, signature=None, cc=None, modes=None, n_dirs=1) -> CUDABuiltKernel:
     """
     Build or load differentiated PTX for one CUDA specialization.
 
@@ -1815,7 +2005,13 @@ def build_cuda(func, signature=None, cc=None, modes=None) -> CUDABuiltKernel:
     # differentiated rather than on the primal's source text.
     kernel = lower_cuda(func, signature=signature, cc=compute_capability)
     cache_key = _cuda_cache_key(
-        func, arg_types, return_type, compute_capability, requested, kernel.ir
+        func,
+        arg_types,
+        return_type,
+        compute_capability,
+        requested,
+        kernel.ir,
+        n_dirs,
     )
     entry_dir = _cache_dir() / "cuda" / cache_key
     # LTO IR rather than PTX: numba-cuda-mlir compiles the calling kernel to
@@ -1824,7 +2020,7 @@ def build_cuda(func, signature=None, cc=None, modes=None) -> CUDABuiltKernel:
     # parameter per primal argument.
     code_path = entry_dir / "derivative.ltoir"
     meta_path = entry_dir / "meta.json"
-    signatures = _device_signatures(arg_types, return_type, shape)
+    signatures = _device_signatures(arg_types, return_type, shape, n_dirs)
     n_args = len(arg_types)
 
     if code_path.is_file() and meta_path.is_file():
@@ -1838,18 +2034,19 @@ def build_cuda(func, signature=None, cc=None, modes=None) -> CUDABuiltKernel:
             shape=shape,
             path=code_path,
             from_cache=True,
+            n_dirs=n_dirs,
         )
 
-    driver = synthesise_cuda(kernel, cache_key[:24], modes=requested)
     toolchain = get_toolchain()
     entry_dir.mkdir(parents=True, exist_ok=True)
     kernel_path = entry_dir / "kernel.ll"
+    kernel_path.write_text(kernel.ir)
+
+    driver = synthesise_cuda(kernel, cache_key[:24], modes=requested, n_dirs=n_dirs)
     driver_path = entry_dir / "driver.ll"
     combined_path = entry_dir / "combined.ll"
     enzyme_path = entry_dir / "enzyme_out.ll"
-    kernel_path.write_text(kernel.ir)
     driver_path.write_text(driver.ir)
-
     subprocess.run(
         [
             str(toolchain.llvm_link),
@@ -1915,6 +2112,7 @@ def build_cuda(func, signature=None, cc=None, modes=None) -> CUDABuiltKernel:
         shape=shape,
         path=code_path,
         from_cache=False,
+        n_dirs=n_dirs,
     )
 
 
@@ -1981,7 +2179,7 @@ def load_cuda(built: CUDABuiltKernel) -> CUDADifferentiable:
         names = [parameter.split("=")[0] for parameter in parameters]
         symbols = built.symbols[mode]
         if built.shape == "tuple":
-            arity = _call_arities(mode, n_args)[built.shape]
+            arity = _call_arities(mode, n_args, built.n_dirs)[built.shape]
             entry = external(symbols[0], built.signatures[mode])
             externals[mode] = entry
             namespace = {"_entry": entry}
@@ -2216,9 +2414,24 @@ def lazy_cuda_derivative(func, mode, signature=None, cc=None):
             for t in arg_types
             if t is not None and not isinstance(t, cuda_types.Omitted)
         )
-        shape = next(
-            (name for name, arity in arities.items() if arity == len(supplied)), None
-        )
+        # A `jvp` call site says how many sweeps it wants by how many mirrored
+        # direction sets it passes, so each count has its own arity; a `vjp`
+        # says so by the rank of its cotangent, whose extent then gives the
+        # count at run time.
+        shape, sweeps = None, 1
+        if arities.get("scalar") == len(supplied):
+            shape = "scalar"
+        else:
+            for candidate in range(1, _MAX_DIRECTIONS + 1):
+                if _call_arities(mode, n_params, candidate).get("tuple") == len(
+                    supplied
+                ):
+                    shape, sweeps = "tuple", candidate
+                    break
+        if shape == "tuple" and mode == "vjp":
+            cotangent = supplied[0]
+            if isinstance(cotangent, cuda_types.Array) and cotangent.ndim == 2:
+                sweeps = 2
         if shape is None:
             expected = " or ".join(str(arity) for arity in arities.values())
             raise CUDAEnzymeError(
@@ -2286,7 +2499,7 @@ def lazy_cuda_derivative(func, mode, signature=None, cc=None):
                 )
 
         differentiated = differentiate_cuda(
-            func, signature=resolved, cc=cc, modes=(mode,)
+            func, signature=resolved, cc=cc, modes=(mode,), n_dirs=sweeps
         )
         return differentiated.implementations[mode]
 
@@ -2316,7 +2529,9 @@ def lazy_cuda_derivative(func, mode, signature=None, cc=None):
     return placeholder
 
 
-def differentiate_cuda(func, signature=None, cc=None, modes=None) -> CUDADifferentiable:
+def differentiate_cuda(
+    func, signature=None, cc=None, modes=None, n_dirs=1
+) -> CUDADifferentiable:
     """
     Compile and load CUDA derivative modes for a device function.
 
@@ -2348,14 +2563,25 @@ def differentiate_cuda(func, signature=None, cc=None, modes=None) -> CUDADiffere
     # The on-disk cache keys on the lowered IR, which costs a lowering to
     # compute. In-process the dispatcher's own identity already distinguishes
     # everything that key would, without that cost.
-    cache_key = (func, arg_types, return_type, compute_capability, requested)
+    cache_key = (
+        func,
+        arg_types,
+        return_type,
+        compute_capability,
+        requested,
+        n_dirs,
+    )
     with _LOAD_LOCK:
         existing = _LOADED_CUDA_DERIVATIVES.get(cache_key)
         if existing is not None:
             return existing
         differentiated = load_cuda(
             build_cuda(
-                func, signature=signature, cc=compute_capability, modes=requested
+                func,
+                signature=signature,
+                cc=compute_capability,
+                modes=requested,
+                n_dirs=n_dirs,
             )
         )
         _LOADED_CUDA_DERIVATIVES[cache_key] = differentiated

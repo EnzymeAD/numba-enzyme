@@ -523,8 +523,20 @@ def test_tuple_reverse_signatures_and_driver_shapes():
     signature = (types.float64, types.float64)
     return_type = types.UniTuple(types.float64, 2)
     signatures = _device_signatures(signature, return_type, "tuple")
-    # grad and jvp need a scalar-return primal, so a tuple one has neither.
-    assert set(signatures) == {"jacfwd", "jacfwd_column", "vjp", "jacrev", "jacrev_row"}
+    # grad needs a scalar-return primal. jvp and jvp2 are directional, so their
+    # result is the whole tangent and a tuple-returning primal supports them,
+    # through the array call shape the other tuple modes use.
+    assert set(signatures) == {
+        "jacfwd",
+        "jacfwd_column",
+        "jvp",
+        "vjp",
+        "jacrev",
+        "jacrev_row",
+    }
+    # (tangent, x0, x1, d0, d1): the direction set mirrors the primal's own
+    # arguments, one set per sweep.
+    assert signatures["jvp"].args == (types.float64[::1],) + (types.float64,) * 4
     assert signatures["vjp"].args == (
         types.float64[::1],
         types.float64[::1],
@@ -1157,3 +1169,85 @@ def test_a_nested_primal_is_found_under_its_qualified_name():
 
     assert "_3clocals_3e" in kernel.entry_symbol
     assert f"@{kernel.entry_symbol}(" in kernel.ir
+
+
+def test_tuple_jvp_is_the_jacobian_applied_to_a_direction():
+    """One sweep must give ``J @ d``, matching the column-by-column assembly."""
+
+    if not cuda.is_available():
+        pytest.skip("a CUDA GPU is not available")
+    _require_numba_cuda_mlir_compiler()
+
+    cc = cuda.get_current_device().compute_capability
+    tangent_of = jvp(tuple_device, cc=cc)
+
+    @cuda.jit
+    def kernel(x, y, d, out):
+        value = cuda.local.array(2, types.float64)
+        tangent_of(value, x[0], y[0], d[0], d[1])
+        for r in range(2):
+            out[r] = value[r]
+
+    out = cuda.device_array(2, dtype=np.float64)
+    direction = np.asarray([0.3, -1.7])
+    kernel[1, 1](
+        cuda.to_device(np.asarray([1.5])),
+        cuda.to_device(np.asarray([0.75])),
+        cuda.to_device(direction),
+        out,
+    )
+    expected = _tuple_jacobian(1.5, 0.75) @ direction
+    np.testing.assert_allclose(out.copy_to_host(), expected, rtol=1e-12)
+
+
+def test_multiple_directions_and_cotangents():
+    """jvp and vjp take several sweeps at once; jacfwd and jacrev are the
+    identity-seeded cases of exactly those loops."""
+
+    if not cuda.is_available():
+        pytest.skip("a CUDA GPU is not available")
+    _require_numba_cuda_mlir_compiler()
+
+    cc = cuda.get_current_device().compute_capability
+    one_direction = jvp(tuple_device, cc=cc)
+    two_directions = jvp(tuple_device, cc=cc)
+    cotangents = vjp(tuple_device, cc=cc)
+    forward = jacfwd(tuple_device, cc=cc)
+    backward = jacrev(tuple_device, cc=cc)
+
+    @cuda.jit
+    def kernel(x, y, dirs, cots, single, several, one_row, rows, fwd, rev):
+        value = cuda.local.array(2, types.float64)
+        one_direction(value, x[0], y[0], dirs[0, 0], dirs[0, 1])
+        for r in range(2):
+            single[r] = value[r]
+        two_directions(
+            several, x[0], y[0], dirs[0, 0], dirs[0, 1], dirs[1, 0], dirs[1, 1]
+        )
+        cotangents(cots[0], one_row, x[0], y[0])
+        cotangents(cots, rows, x[0], y[0])
+        forward(fwd, x[0], y[0])
+        backward(rev, x[0], y[0])
+
+    dirs = np.asarray([[0.3, -1.7], [2.1, 0.45]])
+    cots = np.asarray([[1.0, 0.0], [0.0, 1.0]])
+    buffers = [
+        cuda.device_array(shape, dtype=np.float64)
+        for shape in (2, (2, 2), 2, (2, 2), (2, 2), (2, 2))
+    ]
+    kernel[1, 1](
+        cuda.to_device(np.asarray([1.5])),
+        cuda.to_device(np.asarray([0.75])),
+        cuda.to_device(dirs),
+        cuda.to_device(cots),
+        *buffers,
+    )
+    single, several, one_row, rows, fwd, rev = (b.copy_to_host() for b in buffers)
+    jacobian = _tuple_jacobian(1.5, 0.75)
+    np.testing.assert_allclose(single, jacobian @ dirs[0], rtol=1e-12)
+    np.testing.assert_allclose(several, (jacobian @ dirs.T).T, rtol=1e-12)
+    np.testing.assert_allclose(one_row, cots[0] @ jacobian, rtol=1e-12)
+    np.testing.assert_allclose(rows, cots @ jacobian, rtol=1e-12)
+    # jacfwd is the identity direction set; jacrev the identity cotangent set.
+    np.testing.assert_allclose(fwd, jacobian, rtol=1e-12)
+    np.testing.assert_allclose(rev, jacobian, rtol=1e-12)

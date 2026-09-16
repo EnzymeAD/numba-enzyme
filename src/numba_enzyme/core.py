@@ -161,6 +161,12 @@ def jvp(func: Callable, *, signature=None, cc=None) -> Callable:
         or one scalar for CUDA. The CUDA result is a device callable intended
         for use inside CUDA-compiled code.
 
+    For a tuple-returning CUDA primal the call takes the array shape
+    ``(tangent, *args, *directions)``, one mirrored direction set per sweep;
+    several sets write a matrix, one row each, and `jacfwd` is that same loop
+    with the identity supplied internally.
+
+
     See Also
     --------
     grad : The reverse-mode counterpart of this function.
