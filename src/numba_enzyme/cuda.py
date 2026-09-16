@@ -2150,7 +2150,7 @@ def build_cuda(
                 # arguments emitted by LLVM 15. instnamer makes the final
                 # textual IR round-trip through libNVVM without changing
                 # semantics.
-                "-passes=enzyme,instcombine,adce,globaldce,instnamer",
+                "-passes=enzyme,adce,globaldce,instnamer",
                 "-S",
                 str(combined_path),
                 "-o",
