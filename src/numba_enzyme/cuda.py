@@ -129,6 +129,7 @@ class CUDABuiltKernel:
     shape: str
     path: Path
     from_cache: bool
+    depth: int = 1
     n_dirs: int = 1
 
 
@@ -799,7 +800,7 @@ _TUPLE_CALL_LAYOUT = {
 _MAX_DIRECTIONS = 8
 
 
-def _call_arities(mode, n_params, n_dirs=1):
+def _call_arities(mode, n_params, depth=1, n_dirs=1):
     """
     Return how many arguments a call to `mode` takes for each primal shape.
 
@@ -830,12 +831,13 @@ def _call_arities(mode, n_params, n_dirs=1):
         # *all* of its arguments, so it takes a direction per argument and the
         # level's own argument list doubles: 2**(depth - 1) copies of the
         # primal's. A directional endpoint then adds a seed of that same width.
+        groups = 2 ** (depth - 1)
         sets = n_dirs if directions else 0
-        arities["tuple"] = leading + n_params * (1 + sets) + int(selector)
+        arities["tuple"] = leading + n_params * groups * (1 + sets) + int(selector)
     return arities
 
 
-def _call_parameters(mode, n_params):
+def _call_parameters(mode, n_params, depth=1):
     """
     Return the Python parameters shared by `mode`'s placeholder and bodies.
 
@@ -856,8 +858,8 @@ def _call_parameters(mode, n_params):
     --------
     _call_arities : The call shapes these parameters cover.
     """
-    required = min(_call_arities(mode, n_params, 1).values())
-    widest = max(_call_arities(mode, n_params, _MAX_DIRECTIONS).values())
+    required = min(_call_arities(mode, n_params, depth, 1).values())
+    widest = max(_call_arities(mode, n_params, depth, _MAX_DIRECTIONS).values())
     return tuple(
         f"a{index}" if index < required else f"a{index}=None" for index in range(widest)
     )
@@ -939,7 +941,9 @@ def synthesise_cuda(
     kernel: CUDALoweredKernel,
     symbol_suffix: str,
     modes=None,
+    depth=1,
     n_dirs=1,
+    stage=None,
 ) -> CUDASynthesisedDriver:
     """
     Build C-ABI device wrappers containing Enzyme marker calls.
@@ -975,8 +979,16 @@ def synthesise_cuda(
     shape = _primal_shape(kernel.return_type)
     _validate_modes_for_shape(requested, shape)
     if shape == "tuple":
-        return _synthesise_cuda_tuple(kernel, symbol_suffix, requested, module, n_dirs)
+        return _synthesise_cuda_tuple(
+            kernel, symbol_suffix, requested, module, depth, n_dirs, stage
+        )
 
+    if depth != 1:
+        raise CUDAEnzymeError(
+            "composing derivatives needs a tuple-returning primal; a "
+            "scalar-return one has no array call shape to carry the extra "
+            "direction sets"
+        )
     scalar_type = _SCALAR_IR_TYPE[str(kernel.return_type)]
     n_args = len(kernel.arg_types)
 
@@ -1181,7 +1193,9 @@ def _synthesise_cuda_tuple(
     symbol_suffix: str,
     requested,
     module,
+    depth=1,
     n_dirs=1,
+    stage=None,
 ) -> CUDASynthesisedDriver:
     """
     Build the derivative entry points for a tuple-returning primal.
@@ -1243,7 +1257,7 @@ def _synthesise_cuda_tuple(
     fwddiff = None
     # Inner composition levels are forward sweeps whatever the endpoint is, so
     # a reverse endpoint over a jvp still needs the forward marker declared.
-    if requested & TUPLE_FORWARD_MODES:
+    if requested & TUPLE_FORWARD_MODES or depth > 1:
         fwddiff = ir.Function(
             module,
             ir.FunctionType(result_type, [i8p], var_arg=True),
@@ -1444,10 +1458,47 @@ def _synthesise_cuda_tuple(
             scalars += flatten(builder, handles[start : start + n_parameters])
         return scalars
 
+    # ---- inner composition levels ---------------------------------------
+    # Every level below the endpoint is emitted as an internal *definition*, so
+    # that one Enzyme pass resolves the whole nest of markers. Differentiating
+    # an already-built derivative instead would present Enzyme with an external
+    # declaration and no body, which is why composition happens here rather
+    # than by re-entering the public API. A forward level differentiates the
+    # level below with respect to all of its arguments, so it takes a direction
+    # per argument -- the call widens by one copy of the primal's argument list
+    # per level -- and keeps the output count.
     level_fn, level_args = primal_fn, n_args
     level_params = list(argument_params)
+    for position in range(1, depth):
+        inner = ir.Function(
+            module,
+            ir.FunctionType(result_type, [scalar_type] * (2 * level_args)),
+            name=f"numba_enzyme_level{position}_{symbol_suffix}",
+        )
+        if stage == "endpoints":
+            # An earlier Enzyme run already turned this level into a real
+            # function; this stage links against it and only calls it.
+            pass
+        else:
+            # It has to stay visible for the next stage's link to resolve it.
+            inner.linkage = "external" if stage == "levels" else "internal"
+            body = ir.IRBuilder(inner.append_basic_block("entry"))
+            body.ret(
+                seeded(
+                    body,
+                    level_fn,
+                    list(inner.args[:level_args]),
+                    list(inner.args[level_args:]),
+                )
+            )
+        level_params += mirrored_params(f"d{position}_")
+        level_fn, level_args = inner, 2 * level_args
 
     symbols = {}
+    if stage == "levels":
+        # This stage exists only to resolve the inner markers; the endpoint
+        # goes in the next one.
+        return CUDASynthesisedDriver(ir=str(module), modes=requested, symbols=symbols)
     if "jacfwd_column" in requested:
         # (column, <level arguments>, index).
         symbol = f"numba_enzyme_jacfwdcol_{symbol_suffix}"
@@ -1664,7 +1715,7 @@ def _source_text(func) -> str:
 
 
 def _cuda_cache_key(
-    func, arg_types, return_type, cc, modes, kernel_ir, n_dirs=1
+    func, arg_types, return_type, cc, modes, kernel_ir, depth=1, n_dirs=1
 ) -> str:
     """
     Compute the cache key for a CUDA derivative specialization.
@@ -1695,6 +1746,7 @@ def _cuda_cache_key(
     options = getattr(func, "targetoptions", {})
     material = {
         "modes": sorted(modes),
+        "depth": depth,
         "directions": n_dirs,
         "kernel_ir": kernel_ir,
         "source": _source_text(func),
@@ -1714,7 +1766,7 @@ def _cuda_cache_key(
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
 
-def _device_signatures(arg_types, return_type, shape, n_dirs=1) -> dict:
+def _device_signatures(arg_types, return_type, shape, depth=1, n_dirs=1) -> dict:
     """
     Construct public Numba signatures for the derivative device calls.
 
@@ -1753,7 +1805,7 @@ def _device_signatures(arg_types, return_type, shape, n_dirs=1) -> dict:
             supplied if width is not None else argument
             for argument, width in zip(arg_types, _argument_widths(arg_types))
         )
-        level = scalars
+        level = scalars * (2 ** (depth - 1))
         # One sweep writes a vector; several write a matrix, one slice each.
         sweeps = matrix if n_dirs > 1 else array
         return {
@@ -1971,7 +2023,9 @@ def _resolve_specialization(func, signature, cc, modes):
     )
 
 
-def build_cuda(func, signature=None, cc=None, modes=None, n_dirs=1) -> CUDABuiltKernel:
+def build_cuda(
+    func, signature=None, cc=None, modes=None, depth=1, n_dirs=1
+) -> CUDABuiltKernel:
     """
     Build or load differentiated PTX for one CUDA specialization.
 
@@ -2011,6 +2065,7 @@ def build_cuda(func, signature=None, cc=None, modes=None, n_dirs=1) -> CUDABuilt
         compute_capability,
         requested,
         kernel.ir,
+        depth,
         n_dirs,
     )
     entry_dir = _cache_dir() / "cuda" / cache_key
@@ -2020,7 +2075,7 @@ def build_cuda(func, signature=None, cc=None, modes=None, n_dirs=1) -> CUDABuilt
     # parameter per primal argument.
     code_path = entry_dir / "derivative.ltoir"
     meta_path = entry_dir / "meta.json"
-    signatures = _device_signatures(arg_types, return_type, shape, n_dirs)
+    signatures = _device_signatures(arg_types, return_type, shape, depth, n_dirs)
     n_args = len(arg_types)
 
     if code_path.is_file() and meta_path.is_file():
@@ -2034,6 +2089,7 @@ def build_cuda(func, signature=None, cc=None, modes=None, n_dirs=1) -> CUDABuilt
             shape=shape,
             path=code_path,
             from_cache=True,
+            depth=depth,
             n_dirs=n_dirs,
         )
 
@@ -2042,46 +2098,69 @@ def build_cuda(func, signature=None, cc=None, modes=None, n_dirs=1) -> CUDABuilt
     kernel_path = entry_dir / "kernel.ll"
     kernel_path.write_text(kernel.ir)
 
-    driver = synthesise_cuda(kernel, cache_key[:24], modes=requested, n_dirs=n_dirs)
-    driver_path = entry_dir / "driver.ll"
-    combined_path = entry_dir / "combined.ll"
-    enzyme_path = entry_dir / "enzyme_out.ll"
-    driver_path.write_text(driver.ir)
-    subprocess.run(
-        [
-            str(toolchain.llvm_link),
-            "-opaque-pointers=0",
-            str(kernel_path),
-            str(driver_path),
-            "-S",
-            "-o",
-            str(combined_path),
-        ],
-        check=True,
-    )
-    combined_path.write_text(
-        _internalise_primal(combined_path.read_text(), kernel.entry_symbol)
-    )
-    subprocess.run(
-        [
-            str(toolchain.opt),
-            "-opaque-pointers=0",
-            f"-load-pass-plugin={toolchain.enzyme_plugin}",
-            # The cleanup passes remove now-dead Enzyme marker declarations
-            # and activity globals before libNVVM sees the module.
-            # libNVVM's LLVM 7 text reader rejects unnamed/numeric function
-            # arguments emitted by LLVM 15. instnamer makes the final textual
-            # IR round-trip through libNVVM without changing semantics.
-            "-passes=enzyme,instcombine,adce,globaldce,instnamer",
-            "-S",
-            str(combined_path),
-            "-o",
-            str(enzyme_path),
-        ],
-        check=True,
-    )
+    # Enzyme preprocesses a callee before resolving a marker nested inside it,
+    # so a reverse endpoint over a forward composition level cannot be built in
+    # one pass: the inner marker is still a marker when the outer sweep reaches
+    # it. Splitting the module in two and running Enzyme on each in turn gives
+    # the outer sweep a real function to differentiate. Forward markers nest
+    # happily, so everything else stays a single pass.
+    staged = bool(requested & REVERSE_MODES) and depth > 1
+    stages = ("levels", "endpoints") if staged else (None,)
+    source_path = kernel_path
+    driver = None
+    for index, stage in enumerate(stages):
+        driver = synthesise_cuda(
+            kernel,
+            cache_key[:24],
+            modes=requested,
+            depth=depth,
+            n_dirs=n_dirs,
+            stage=stage,
+        )
+        driver_path = entry_dir / f"driver{index}.ll"
+        combined_path = entry_dir / f"combined{index}.ll"
+        enzyme_path = entry_dir / f"enzyme_out{index}.ll"
+        driver_path.write_text(driver.ir)
+        subprocess.run(
+            [
+                str(toolchain.llvm_link),
+                "-opaque-pointers=0",
+                str(source_path),
+                str(driver_path),
+                "-S",
+                "-o",
+                str(combined_path),
+            ],
+            check=True,
+        )
+        if stage != "levels":
+            # Only once the last stage has linked: the primal has to stay
+            # visible for an intermediate stage to resolve against it.
+            combined_path.write_text(
+                _internalise_primal(combined_path.read_text(), kernel.entry_symbol)
+            )
+        subprocess.run(
+            [
+                str(toolchain.opt),
+                "-opaque-pointers=0",
+                f"-load-pass-plugin={toolchain.enzyme_plugin}",
+                # The cleanup passes remove now-dead Enzyme marker declarations
+                # and activity globals before libNVVM sees the module.
+                # libNVVM's LLVM 7 text reader rejects unnamed/numeric function
+                # arguments emitted by LLVM 15. instnamer makes the final
+                # textual IR round-trip through libNVVM without changing
+                # semantics.
+                "-passes=enzyme,instcombine,adce,globaldce,instnamer",
+                "-S",
+                str(combined_path),
+                "-o",
+                str(enzyme_path),
+            ],
+            check=True,
+        )
+        source_path = enzyme_path
 
-    enzyme_ir = _sanitize_for_libnvvm(enzyme_path.read_text())
+    enzyme_ir = _sanitize_for_libnvvm(source_path.read_text())
     if re.search(r"\bcall\b[^\n]*@__enzyme_(?:autodiff|fwddiff)", enzyme_ir):
         raise CUDAEnzymeError("Enzyme left unresolved differentiation marker calls")
     cc_text = f"{compute_capability[0]}{compute_capability[1]}"
@@ -2112,6 +2191,7 @@ def build_cuda(func, signature=None, cc=None, modes=None, n_dirs=1) -> CUDABuilt
         shape=shape,
         path=code_path,
         from_cache=False,
+        depth=depth,
         n_dirs=n_dirs,
     )
 
@@ -2175,11 +2255,11 @@ def load_cuda(built: CUDABuiltKernel) -> CUDADifferentiable:
     implementations = {}
     externals = {}
     for mode in built.modes:
-        parameters = _call_parameters(mode, n_args)
+        parameters = _call_parameters(mode, n_args, built.depth)
         names = [parameter.split("=")[0] for parameter in parameters]
         symbols = built.symbols[mode]
         if built.shape == "tuple":
-            arity = _call_arities(mode, n_args, built.n_dirs)[built.shape]
+            arity = _call_arities(mode, n_args, built.depth, built.n_dirs)[built.shape]
             entry = external(symbols[0], built.signatures[mode])
             externals[mode] = entry
             namespace = {"_entry": entry}
@@ -2326,7 +2406,7 @@ def _inline_unless_star_call(expr, caller_info, callee_info):
     return expr.vararg is None
 
 
-def lazy_cuda_derivative(func, mode, signature=None, cc=None):
+def lazy_cuda_derivative(func, mode, signature=None, cc=None, depth=1):
     """
     Create a derivative callable specialized during MLIR call-site typing.
 
@@ -2382,8 +2462,8 @@ def lazy_cuda_derivative(func, mode, signature=None, cc=None):
             "lazy CUDA differentiation requires one or more positional parameters"
         )
     n_params = len(primal_parameters)
-    arities = _call_arities(mode, n_params)
-    parameters = _call_parameters(mode, n_params)
+    arities = _call_arities(mode, n_params, depth)
+    parameters = _call_parameters(mode, n_params, depth)
     names = tuple(parameter.split("=")[0] for parameter in parameters)
     primal_name = func.py_func.__name__
 
@@ -2423,7 +2503,7 @@ def lazy_cuda_derivative(func, mode, signature=None, cc=None):
             shape = "scalar"
         else:
             for candidate in range(1, _MAX_DIRECTIONS + 1):
-                if _call_arities(mode, n_params, candidate).get("tuple") == len(
+                if _call_arities(mode, n_params, depth, candidate).get("tuple") == len(
                     supplied
                 ):
                     shape, sweeps = "tuple", candidate
@@ -2499,7 +2579,7 @@ def lazy_cuda_derivative(func, mode, signature=None, cc=None):
                 )
 
         differentiated = differentiate_cuda(
-            func, signature=resolved, cc=cc, modes=(mode,), n_dirs=sweeps
+            func, signature=resolved, cc=cc, modes=(mode,), depth=depth, n_dirs=sweeps
         )
         return differentiated.implementations[mode]
 
@@ -2526,11 +2606,12 @@ def lazy_cuda_derivative(func, mode, signature=None, cc=None):
     placeholder.__qualname__ = placeholder.__name__
     placeholder._numba_enzyme_primal = func
     placeholder._numba_enzyme_mode = mode
+    placeholder._numba_enzyme_depth = depth
     return placeholder
 
 
 def differentiate_cuda(
-    func, signature=None, cc=None, modes=None, n_dirs=1
+    func, signature=None, cc=None, modes=None, depth=1, n_dirs=1
 ) -> CUDADifferentiable:
     """
     Compile and load CUDA derivative modes for a device function.
@@ -2569,6 +2650,7 @@ def differentiate_cuda(
         return_type,
         compute_capability,
         requested,
+        depth,
         n_dirs,
     )
     with _LOAD_LOCK:
@@ -2581,6 +2663,7 @@ def differentiate_cuda(
                 signature=signature,
                 cc=compute_capability,
                 modes=requested,
+                depth=depth,
                 n_dirs=n_dirs,
             )
         )

@@ -535,8 +535,11 @@ def test_tuple_reverse_signatures_and_driver_shapes():
         "jacrev_row",
     }
     # (tangent, x0, x1, d0, d1): the direction set mirrors the primal's own
-    # arguments, one set per sweep.
+    # arguments. Each composition level doubles that, since it differentiates
+    # the level below with respect to all of its arguments.
     assert signatures["jvp"].args == (types.float64[::1],) + (types.float64,) * 4
+    composed = _device_signatures(signature, return_type, "tuple", depth=2)
+    assert composed["jvp"].args == (types.float64[::1],) + (types.float64,) * 8
     assert signatures["vjp"].args == (
         types.float64[::1],
         types.float64[::1],
@@ -1200,6 +1203,64 @@ def test_tuple_jvp_is_the_jacobian_applied_to_a_direction():
     np.testing.assert_allclose(out.copy_to_host(), expected, rtol=1e-12)
 
 
+def test_tuple_jvp_composes_into_a_second_derivative():
+    """``jvp(jvp(f))`` is the second-order forward sweep.
+
+    ``tuple_device(x, y) = (x * y, x * x + y)``, so the only non-zero second
+    partials are ``d2f0/dx dy = 1`` and ``d2f1/dx2 = 2``. Composing makes the
+    derivative of the whole tangent map, a function of ``(x, u)``, so the call
+    carries a fourth direction ``w`` for the inner direction's own variation
+    and returns ``D2 f[u, v] + D f[w]``.
+    """
+
+    if not cuda.is_available():
+        pytest.skip("a CUDA GPU is not available")
+    _require_numba_cuda_mlir_compiler()
+
+    cc = cuda.get_current_device().compute_capability
+    second = jvp(jvp(tuple_device, cc=cc), cc=cc)
+
+    @cuda.jit
+    def kernel(x, y, u, v, w, bilinear, with_w):
+        value = cuda.local.array(2, types.float64)
+        second(value, x[0], y[0], u[0], u[1], v[0], v[1], 0.0, 0.0)
+        for r in range(2):
+            bilinear[r] = value[r]
+        second(value, x[0], y[0], u[0], u[1], v[0], v[1], w[0], w[1])
+        for r in range(2):
+            with_w[r] = value[r]
+
+    u = np.asarray([0.3, -1.7])
+    v = np.asarray([2.1, 0.45])
+    w = np.asarray([-0.6, 1.25])
+    bilinear = cuda.device_array(2, dtype=np.float64)
+    with_w = cuda.device_array(2, dtype=np.float64)
+    kernel[1, 1](
+        cuda.to_device(np.asarray([1.5])),
+        cuda.to_device(np.asarray([0.75])),
+        cuda.to_device(u),
+        cuda.to_device(v),
+        cuda.to_device(w),
+        bilinear,
+        with_w,
+    )
+    expected = np.asarray([u[0] * v[1] + u[1] * v[0], 2.0 * u[0] * v[0]])
+    np.testing.assert_allclose(bilinear.copy_to_host(), expected, rtol=1e-12)
+    # A non-zero fourth direction adds the first-order term J @ w.
+    np.testing.assert_allclose(
+        with_w.copy_to_host(),
+        expected + _tuple_jacobian(1.5, 0.75) @ w,
+        rtol=1e-12,
+    )
+
+
+def test_only_a_forward_sweep_can_be_an_inner_level():
+    """A derivative composes over a jvp; nothing composes over anything else."""
+
+    with pytest.raises(TypeError, match="does not compose over"):
+        jvp(jacfwd(tuple_device, cc=(8, 0)), cc=(8, 0))
+
+
 def test_multiple_directions_and_cotangents():
     """jvp and vjp take several sweeps at once; jacfwd and jacrev are the
     identity-seeded cases of exactly those loops."""
@@ -1251,3 +1312,39 @@ def test_multiple_directions_and_cotangents():
     # jacfwd is the identity direction set; jacrev the identity cotangent set.
     np.testing.assert_allclose(fwd, jacobian, rtol=1e-12)
     np.testing.assert_allclose(rev, jacobian, rtol=1e-12)
+
+
+def test_reverse_endpoints_compose_over_a_forward_level():
+    """A reverse sweep over a jvp, which needs one Enzyme run per stage.
+
+    ``D f(x, y)[u]`` as a function of ``(x, y, u0, u1)`` has an exactly known
+    Jacobian, and every endpoint should agree on it.
+    """
+
+    if not cuda.is_available():
+        pytest.skip("a CUDA GPU is not available")
+    _require_numba_cuda_mlir_compiler()
+
+    cc = cuda.get_current_device().compute_capability
+    inner = jvp(tuple_device, cc=cc)
+    rows = jacrev(inner, cc=cc)
+    columns = jacfwd(inner, cc=cc)
+
+    @cuda.jit
+    def kernel(a, by_row, by_column):
+        rows(by_row, a[0], a[1], a[2], a[3])
+        columns(by_column, a[0], a[1], a[2], a[3])
+
+    a = np.asarray([1.5, 0.75, 0.3, -1.7])
+    by_row = cuda.device_array((2, 4), dtype=np.float64)
+    by_column = cuda.device_array((2, 4), dtype=np.float64)
+    kernel[1, 1](cuda.to_device(a), by_row, by_column)
+
+    x, y, u0, u1 = a
+    # d/d(x, y, u0, u1) of (u0*y + u1*x, 2*x*u0 + u1)
+    expected = np.asarray([[u1, u0, y, x], [2.0 * u0, 0.0, 2.0 * x, 1.0]])
+    np.testing.assert_allclose(by_row.copy_to_host(), expected, rtol=1e-9)
+    # Forward and reverse must agree, which is the real cross-check.
+    np.testing.assert_allclose(
+        by_row.copy_to_host(), by_column.copy_to_host(), rtol=1e-9
+    )

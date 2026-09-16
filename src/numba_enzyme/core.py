@@ -66,8 +66,27 @@ def _differentiate(func, mode, signature, cc):
     """
     from numba_enzyme.cuda import is_cuda_device_function, lazy_cuda_derivative
 
+    # Composing a derivative with itself: jvp(jvp(f)) is the second-order
+    # forward sweep. The chain is recorded rather than applied, because a
+    # derivative that has already been built is an external device symbol with
+    # no body for Enzyme to differentiate; the whole chain is emitted as
+    # definitions in one module when the outermost call site is compiled.
+    base = getattr(func, "_numba_enzyme_primal", None)
+    depth = 1
+    if base is not None:
+        inner_mode = getattr(func, "_numba_enzyme_mode", None)
+        if inner_mode != "jvp":
+            raise TypeError(
+                f"{mode} does not compose over {inner_mode}; only a forward "
+                "directional derivative (jvp) can be an inner level"
+            )
+        depth = func._numba_enzyme_depth + 1
+        func = base
+
     if is_cuda_device_function(func):
-        return lazy_cuda_derivative(func, mode, signature=signature, cc=cc)
+        return lazy_cuda_derivative(func, mode, signature=signature, cc=cc, depth=depth)
+    if depth != 1:
+        raise TypeError("composing derivatives is only supported for CUDA")
     if signature is not None or cc is not None:
         raise TypeError("signature and cc are only valid for CUDA device functions")
     if not is_annotated(func):
@@ -166,6 +185,11 @@ def jvp(func: Callable, *, signature=None, cc=None) -> Callable:
     several sets write a matrix, one row each, and `jacfwd` is that same loop
     with the identity supplied internally.
 
+    A CUDA derivative is also a valid primal: ``jvp(jvp(f))`` is the
+    second-order forward sweep, and every endpoint composes over a `jvp`. The
+    chain is recorded rather than applied -- an already-built derivative is an
+    external symbol with no body for Enzyme to differentiate -- and emitted as
+    definitions, one Enzyme run per stage.
 
     See Also
     --------
