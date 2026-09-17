@@ -34,9 +34,7 @@ from numba_enzyme import (
     differentiable,
     grad,
     jacfwd,
-    jacfwd_column,
     jacrev,
-    jacrev_row,
     jvp,
     vjp,
 )
@@ -52,11 +50,10 @@ jvp(f)((1.0, 2.0), (1.0, 0.0))  # -> directional derivative along (1.0, 0.0)
 def f_vec(x, y):
     return x * y, x * x + y
 
-jacfwd(f_vec)(1.0, 2.0)           # -> ((2.0, 1.0), (2.0, 1.0))
-jacfwd_column(f_vec)(1.0, 2.0, 0)  # -> (2.0, 2.0)
+jacfwd(f_vec)(1.0, 2.0)            # -> ((2.0, 1.0), (2.0, 1.0))
+jvp(f_vec)((1.0, 2.0), (1.0, 0.0)) # -> column 0, (2.0, 2.0)
 jacrev(f_vec)(1.0, 2.0)            # -> ((2.0, 1.0), (2.0, 1.0))
-jacrev_row(f_vec)(1.0, 2.0, 1)     # -> (2.0, 1.0)
-vjp(f_vec)((1.0, 2.0), (0.0, 1.0)) # -> (2.0, 1.0)
+vjp(f_vec)((1.0, 2.0), (0.0, 1.0)) # -> row 1, (2.0, 1.0)
 
 @differentiable
 def g(x: Float64, y: Float64) -> Float64:  # annotations fix the types up front
@@ -69,9 +66,9 @@ g.jvp((1.0, 2.0), (1.0, 0.0))  # forward-mode JVP
 ```
 
 `grad` requires its target function to return exactly one scalar. It does not
-accept tuple-valued targets. `jvp`, `jacfwd`, and `jacfwd_column` handle both
-scalar and vector outputs, as do their reverse-mode counterparts `vjp`,
-`jacrev`, and `jacrev_row`. CPU vector outputs use fixed-size homogeneous tuples.
+accept tuple-valued targets. `jvp` and `jacfwd` handle both scalar and vector
+outputs, as do their reverse-mode counterparts `vjp` and `jacrev`. CPU vector
+outputs use fixed-size homogeneous tuples.
 Full Jacobians are returned as output-by-input tuple matrices.
 
 ### Choosing a differentiation operation
@@ -80,11 +77,9 @@ Full Jacobians are returned as output-by-input tuple matrices.
 |---|---|---|
 | `grad` | Reverse | Gradient of a **single scalar output** in one reverse sweep. Prefer this for scalar losses, particularly with many inputs. |
 | `jacfwd` | Forward | Complete Jacobian, using one sweep per input. Prefer it when there are relatively few inputs. |
-| `jacfwd_column` | Forward | One Jacobian column for a selected input. Use it when only that input's effect is needed or storing the full matrix is undesirable. |
 | `jacrev` | Reverse | Complete Jacobian, using one sweep per output. Prefer it when there are relatively few outputs. |
-| `jacrev_row` | Reverse | One Jacobian row for a selected output. Use it when only that output's gradient is needed. |
-| `jvp` | Forward | Jacobian-vector product `J @ tangent` without constructing the Jacobian. Use it for a known input direction. |
-| `vjp` | Reverse | Vector-Jacobian product `cotangent @ J` without constructing the Jacobian. Use it for backpropagation from a known output cotangent. |
+| `jvp` | Forward | Jacobian-vector product `J @ tangent` without constructing the Jacobian. Use it for a known input direction, and for a single column, with a unit direction. |
+| `vjp` | Reverse | Vector-Jacobian product `cotangent @ J` without constructing the Jacobian. Use it for backpropagation from a known output cotangent, and for a single row, with a unit cotangent. |
 
 For a scalar-output function, `grad`, `jacfwd`, and `jacrev` have the same
 values and tuple shape. Their computational paths differ: `grad` and `jacrev`
@@ -138,14 +133,14 @@ One forward sweep gives a whole Jacobian column:
 
 ```python
 import numba
-from numba_enzyme import jacfwd, jacfwd_column
+from numba_enzyme import jacfwd, jvp
 
 @cuda.jit(device=True)
 def f_tuple(x, y):
     return (x * y, x * x + y)
 
 whole = jacfwd(f_tuple)
-one = jacfwd_column(f_tuple)
+sweep = jvp(f_tuple)
 
 @cuda.jit
 def use_jacfwd(xs, ys):
@@ -155,8 +150,16 @@ def use_jacfwd(xs, ys):
         jac = cuda.local.array((2, 2), numba.float64)
 
         whole(jac, xs[i], ys[i])              # the whole matrix
-        one(column, xs[i], ys[i], 1)          # just column 1
+        sweep(column, xs[i], ys[i], 0.0, 1.0) # just column 1
 ```
+
+A `jvp` call takes the primal's arguments and then a direction set mirroring
+them, one set per sweep. `jacfwd` is that same loop with the identity supplied
+internally, and a Jacobian column is the special case of a unit direction —
+written out at the call site as above, it costs no more than the column,
+because the derivative links as LTO IR and nvJitLink inlines it before
+constant propagation: the zero components kill their tangent arithmetic and
+the sweep collapses to the one column that survives.
 
 **Tuple arguments.** A primal may also *take* homogeneous tuples. Every
 derivative call then mirrors the primal's own argument list, with each tuple
@@ -175,53 +178,47 @@ def rhs(ys, t, ps):                        # 48 states, 1 parameter
 signature = types.UniTuple(types.float64, 48)(
     types.UniTuple(types.float64, 48), types.float64, types.UniTuple(types.float64, 1)
 )
-one = jacfwd_column(rhs, signature=signature)
+sweep = jvp(rhs, signature=signature)
 
-# inside CUDA-compiled code, five arguments whatever the tuple lengths are:
-one(column, ys[i], t, ps[i], k)
+# inside CUDA-compiled code, six arguments whatever the tuple lengths are:
+sweep(tangent, ys[i], t, ps[i], dys, dt, dps)
 ```
 
 An array cannot say how long the tuple it stands for is, so a primal with
 tuple arguments needs an explicit `signature`; the call only has to get
-array-ness right. The column index runs over the *flattened* arguments, so in
-the example above `k = 48` seeds `t` and yields `d rhs / d t`.
+array-ness right. The direction set mirrors the primal's arguments, so seeding
+`dt = 1.0` with `dys` and `dps` zero yields `d rhs / d t` — no separate index
+into the flattened arguments, and nothing to materialise in a shape the caller
+does not already have.
 
-`vjp`, `jacrev`, and `jacrev_row` accept either a scalar-returning or a
-tuple-returning primal, and tell them apart by how many arguments the call
-passes. They use the same output-by-input Jacobian layout:
+`vjp` and `jacrev` accept either a scalar-returning or a tuple-returning
+primal, and tell them apart by how many arguments the call passes. They use the
+same output-by-input Jacobian layout:
 
 ```python
-from numba_enzyme import jacrev, jacrev_row, vjp
+from numba_enzyme import jacrev, vjp
 
 reverse = jacrev(f_tuple)
-row = jacrev_row(f_tuple)
 product = vjp(f_tuple)
 
 @cuda.jit
 def use_reverse(x, y, cotangent, jacobian, input_cotangent):
-    # Complete Jacobian and one selected output row.
+    # The complete Jacobian.
     reverse(jacobian, x, y)
-    row(input_cotangent, x, y, 1)
 
-    # cotangent @ J.
+    # cotangent @ J; a unit cotangent picks out one output's row.
     product(cotangent, input_cotangent, x, y)
 ```
 
-`jacobian` has shape `(n_out, n_args)`. `jacrev_row` fills the selected row
-into an `n_args` `input_cotangent` buffer. `vjp` accepts an `n_out` `cotangent`
+`jacobian` has shape `(n_out, n_args)`. `vjp` accepts an `n_out` `cotangent`
 and fills `input_cotangent`. All arrays must be contiguous and use the primal's
 floating-point dtype.
 
-The unit seed is built inside the derivative, as one `select` per argument, so
-no caller materialises a tangent vector. `jacfwd_column` takes the index at run
-time, which for a wide primal roughly halves the arguments marshalled per call;
-it also means every column runs the identical instruction stream and costs the
-same, so a warp's lanes can take different columns without diverging.
-
-Prefer `jacfwd_column` on a GPU: `jacfwd`'s matrix costs `n_out * n_args` per
-thread, which stops being viable well before the dimensions the column shape
-handles comfortably. Because the primal shape differs, neither can share a
-build with the scalar-return modes, and neither is implied by the default.
+Prefer one sweep at a time on a GPU: `jacfwd`'s matrix costs `n_out * n_args`
+per thread, which stops being viable well before the dimensions `jvp` handles
+comfortably. Because the primal shape differs, the tuple modes cannot share a
+build with the scalar-return modes, and none of them is implied by the
+default.
 
 Derivatives are emitted as NVVM LTO IR rather than PTX. Numba-CUDA-MLIR
 compiles the calling kernel to LTO IR too whenever a link item is LTO IR, so

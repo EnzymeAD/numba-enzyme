@@ -88,8 +88,8 @@ def test_vector_output_forward_derivatives():
     jacobian = diff.jacfwd(x, y)
     assert jacobian[0] == pytest.approx((y, x), abs=1e-9)
     assert jacobian[1] == pytest.approx((2 * x, 1.0), abs=1e-9)
-    assert diff.jacfwd_column(x, y, 0) == pytest.approx((y, 2 * x), abs=1e-9)
-    assert diff.jacfwd_column(x, y, 1) == pytest.approx((x, 1.0), abs=1e-9)
+    assert diff.jvp((x, y), (1.0, 0.0)) == pytest.approx((y, 2 * x), abs=1e-9)
+    assert diff.jvp((x, y), (0.0, 1.0)) == pytest.approx((x, 1.0), abs=1e-9)
 
 
 def test_vector_output_reverse_derivatives():
@@ -102,8 +102,8 @@ def test_vector_output_reverse_derivatives():
     jacobian = diff.jacrev(x, y)
     assert jacobian[0] == pytest.approx((y, x), abs=1e-9)
     assert jacobian[1] == pytest.approx((2 * x, 1.0), abs=1e-9)
-    assert diff.jacrev_row(x, y, 0) == pytest.approx((y, x), abs=1e-9)
-    assert diff.jacrev_row(x, y, 1) == pytest.approx((2 * x, 1.0), abs=1e-9)
+    assert diff.vjp((x, y), (1.0, 0.0)) == pytest.approx((y, x), abs=1e-9)
+    assert diff.vjp((x, y), (0.0, 1.0)) == pytest.approx((2 * x, 1.0), abs=1e-9)
 
 
 def test_float32_vector_output_uses_float32_runtime_abi():

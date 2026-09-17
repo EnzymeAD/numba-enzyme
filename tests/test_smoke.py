@@ -15,9 +15,7 @@ def test_public_derivative_api_is_exported():
     expected = {
         "grad",
         "jacfwd",
-        "jacfwd_column",
         "jacrev",
-        "jacrev_row",
         "jvp",
         "vjp",
     }

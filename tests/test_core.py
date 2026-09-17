@@ -10,9 +10,7 @@ from numba_enzyme.core import (
     differentiable,
     grad,
     jacfwd,
-    jacfwd_column,
     jacrev,
-    jacrev_row,
     jvp,
     vjp,
 )
@@ -63,14 +61,6 @@ def test_jacfwd_matches_analytic():
     assert jacfwd(f)(x, y) == pytest.approx(f_grad(x, y), abs=1e-9)
 
 
-def test_jacfwd_column_matches_analytic():
-    x, y = 1.3, 0.7
-    expected = f_grad(x, y)
-    column = jacfwd_column(f)
-    assert column(x, y, 0) == pytest.approx(expected[0], abs=1e-9)
-    assert column(x, y, 1) == pytest.approx(expected[1], abs=1e-9)
-
-
 def test_scalar_output_public_reverse_apis():
     x, y = 1.3, 0.7
     expected = f_grad(x, y)
@@ -78,7 +68,6 @@ def test_scalar_output_public_reverse_apis():
         tuple(2 * value for value in expected), abs=1e-9
     )
     assert jacrev(f)(x, y) == pytest.approx(expected, abs=1e-9)
-    assert jacrev_row(f)(x, y, 0) == pytest.approx(expected, abs=1e-9)
 
 
 def test_vector_output_public_forward_apis():
@@ -87,7 +76,7 @@ def test_vector_output_public_forward_apis():
     jacobian = jacfwd(f_vector)(x, y)
     assert jacobian[0] == pytest.approx((y, x))
     assert jacobian[1] == pytest.approx((2 * x, 1.0))
-    assert jacfwd_column(f_vector)(x, y, 1) == pytest.approx((x, 1.0))
+    assert jvp(f_vector)((x, y), (0.0, 1.0)) == pytest.approx((x, 1.0))
 
 
 def test_vector_output_public_reverse_apis():
@@ -98,7 +87,7 @@ def test_vector_output_public_reverse_apis():
     jacobian = jacrev(f_vector)(x, y)
     assert jacobian[0] == pytest.approx((y, x))
     assert jacobian[1] == pytest.approx((2 * x, 1.0))
-    assert jacrev_row(f_vector)(x, y, 1) == pytest.approx((2 * x, 1.0))
+    assert vjp(f_vector)((x, y), (0.0, 1.0)) == pytest.approx((2 * x, 1.0))
 
 
 def test_grad_rejects_vector_output():
@@ -117,10 +106,8 @@ def test_differentiable_wrapper_exposes_all_derivative_modes():
     assert f_decorated.grad(x, y) == pytest.approx(expected, abs=1e-9)
     assert f_decorated.jvp((x, y), (1.0, 0.0)) == pytest.approx(expected[0], abs=1e-9)
     assert f_decorated.jacfwd(x, y) == pytest.approx(expected, abs=1e-9)
-    assert f_decorated.jacfwd_column(x, y, 1) == pytest.approx(expected[1], abs=1e-9)
     assert f_decorated.vjp((x, y), 1.0) == pytest.approx(expected, abs=1e-9)
     assert f_decorated.jacrev(x, y) == pytest.approx(expected, abs=1e-9)
-    assert f_decorated.jacrev_row(x, y, 0) == pytest.approx(expected, abs=1e-9)
 
 
 def test_differentiable_grad_is_cached():
@@ -130,18 +117,14 @@ def test_differentiable_grad_is_cached():
 
 def test_differentiable_forward_jacobian_callables_are_cached():
     whole = f_decorated.jacfwd
-    column = f_decorated.jacfwd_column
     assert f_decorated.jacfwd is whole
-    assert f_decorated.jacfwd_column is column
 
 
 def test_differentiable_reverse_jacobian_callables_are_cached():
     product = f_decorated.vjp
     whole = f_decorated.jacrev
-    row = f_decorated.jacrev_row
     assert f_decorated.vjp is product
     assert f_decorated.jacrev is whole
-    assert f_decorated.jacrev_row is row
 
 
 def f_plain(x, y):
@@ -161,9 +144,7 @@ def test_unannotated_functions_need_no_types():
         tuple(2 * value for value in expected), abs=1e-9
     )
     assert jacfwd(f_plain)(x, y) == pytest.approx(expected, abs=1e-9)
-    assert jacfwd_column(f_plain)(x, y, 1) == pytest.approx(expected[1], abs=1e-9)
     assert jacrev(f_plain)(x, y) == pytest.approx(expected, abs=1e-9)
-    assert jacrev_row(f_plain)(x, y, 0) == pytest.approx(expected, abs=1e-9)
 
 
 def test_unannotated_vector_function_infers_its_tuple_result():
@@ -171,7 +152,6 @@ def test_unannotated_vector_function_infers_its_tuple_result():
     jacobian = jacfwd(f_plain_vector)(x, y)
     assert jacobian[0] == pytest.approx((y, x))
     assert jacobian[1] == pytest.approx((2 * x, 1.0))
-    assert jacrev_row(f_plain_vector)(x, y, 1) == pytest.approx((2 * x, 1.0))
     assert vjp(f_plain_vector)((x, y), (0.25, -0.5)) == pytest.approx(
         (y * 0.25 - x, x * 0.25 - 0.5)
     )
@@ -228,4 +208,4 @@ def test_differentiable_wrapper_accepts_unannotated_functions():
 
     assert product(2.0, 3.0) == 6.0
     assert product.grad(2.0, 3.0) == pytest.approx((3.0, 2.0))
-    assert product.jacfwd_column(2.0, 3.0, 0) == pytest.approx(3.0)
+    assert product.jacfwd(2.0, 3.0) == pytest.approx((3.0, 2.0))

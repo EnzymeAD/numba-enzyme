@@ -31,7 +31,6 @@ Examples
 
 import ctypes
 import inspect
-import operator
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -73,16 +72,11 @@ class Differentiable:
         Computes the full forward-mode Jacobian. Takes `n_args` positional
         arguments and returns a derivative tuple for a scalar result or an
         output-by-input tuple matrix for a vector result.
-    jacfwd_column : callable
-        Computes one forward-mode Jacobian column. Takes `n_args` primal values
-        followed by a column index and returns a scalar or output tuple.
     vjp : callable
         Computes a reverse-mode vector-Jacobian product from primal values and
         an output cotangent.
     jacrev : callable
         Computes the full Jacobian in reverse mode, one output row per sweep.
-    jacrev_row : callable
-        Computes one runtime-selected Jacobian row in reverse mode.
     n_args : int
         Number of scalar arguments the underlying function takes.
     n_outputs : int
@@ -106,10 +100,8 @@ class Differentiable:
     grad: Callable[..., tuple[float, ...]]
     jvp: Callable[[tuple[float, ...], tuple[float, ...]], float | tuple[float, ...]]
     jacfwd: Callable[..., tuple]
-    jacfwd_column: Callable[..., float | tuple[float, ...]]
     vjp: Callable[[tuple[float, ...], object], tuple[float, ...]]
     jacrev: Callable[..., tuple]
-    jacrev_row: Callable[..., tuple[float, ...]]
     n_args: int
     n_outputs: int
 
@@ -141,61 +133,6 @@ def _unit(length: int, index: int) -> tuple[float, ...]:
     (0.0, 1.0, 0.0)
     """
     return tuple(1.0 if position == index else 0.0 for position in range(length))
-
-
-def _split_index(args, n_args: int, limit: int, kind: str, noun: str):
-    """
-    Split primal values from a trailing row or column index.
-
-    Parameters
-    ----------
-    args : tuple
-        The primal values followed by exactly one index.
-    n_args : int
-        Number of primal values expected.
-    limit : int
-        Exclusive upper bound on the index.
-    kind : str
-        What the index selects, ``"row"`` or ``"column"``, for error messages.
-    noun : str
-        What `limit` counts, for error messages.
-
-    Returns
-    -------
-    xs : tuple of float
-        The primal values.
-    index : int
-        The validated index.
-
-    Raises
-    ------
-    TypeError
-        If the argument count is wrong or the index is not integral.
-    IndexError
-        If the index is out of range.
-
-    See Also
-    --------
-    _unit : Turns the returned index into a seed.
-
-    Examples
-    --------
-    >>> from numba_enzyme.runtime import _split_index
-    >>> _split_index((2.0, 3.0, 1), 2, 2, "column", "arguments")
-    ((2.0, 3.0), 1)
-    """
-    if len(args) != n_args + 1:
-        raise TypeError(
-            f"expected {n_args} primal arguments and one {kind} index, got {len(args)}"
-        )
-    *xs, index = args
-    try:
-        index = operator.index(index)
-    except TypeError:
-        raise TypeError(f"{kind} index must be an integer") from None
-    if not 0 <= index < limit:
-        raise IndexError(f"{kind} index {index} is out of range for {limit} {noun}")
-    return tuple(xs), index
 
 
 def load(built: BuiltKernel) -> Differentiable:
@@ -428,41 +365,6 @@ def load(built: BuiltKernel) -> Differentiable:
             tuple(columns[column][row] for column in range(n)) for row in range(m)
         )
 
-    def jacfwd_column(*args: float) -> float | tuple[float, ...]:
-        """
-        Compute one column of the forward-mode Jacobian.
-
-        Parameters
-        ----------
-        *args : float
-            The primal values followed by a zero-based integer column index.
-
-        Returns
-        -------
-        float or tuple of float
-            The partial derivative for the selected input column. A
-            vector-output function returns one value per output component.
-
-        Raises
-        ------
-        TypeError
-            If the number of arguments is wrong or the index is not integral.
-        IndexError
-            If the column index is out of range.
-
-        Examples
-        --------
-        >>> from numba_enzyme.build import build
-        >>> from numba_enzyme.runtime import load
-        >>> from numba_enzyme.types import Float64
-        >>> def f(x: Float64) -> Float64:
-        ...     return x * x
-        >>> load(build(f)).jacfwd_column(2.0, 0)  # doctest: +SKIP
-        4.0
-        """
-        xs, column = _split_index(args, n, n, "column", "arguments")
-        return jvp(xs, _unit(n, column))
-
     def jacrev(*xs: float) -> tuple:
         """
         Compute the full reverse-mode Jacobian.
@@ -499,48 +401,12 @@ def load(built: BuiltKernel) -> Differentiable:
             return vjp(xs, 1.0)
         return tuple(vjp(xs, _unit(m, row)) for row in range(m))
 
-    def jacrev_row(*args: float) -> tuple[float, ...]:
-        """
-        Compute one row of the reverse-mode Jacobian.
-
-        Parameters
-        ----------
-        *args : float
-            The primal values followed by a zero-based integer row index.
-
-        Returns
-        -------
-        tuple of float
-            One derivative per primal input for the selected output row.
-
-        Raises
-        ------
-        TypeError
-            If the number of arguments is wrong or the index is not integral.
-        IndexError
-            If the row index is out of range.
-
-        Examples
-        --------
-        >>> from numba_enzyme.build import build
-        >>> from numba_enzyme.runtime import load
-        >>> from numba_enzyme.types import Float64
-        >>> def f(x: Float64) -> Float64:
-        ...     return x * x
-        >>> load(build(f)).jacrev_row(2.0, 0)  # doctest: +SKIP
-        (4.0,)
-        """
-        xs, row = _split_index(args, n, m, "row", "outputs")
-        return vjp(xs, 1.0 if m == 1 else _unit(m, row))
-
     return Differentiable(
         grad=grad,
         jvp=jvp,
         jacfwd=jacfwd,
-        jacfwd_column=jacfwd_column,
         vjp=vjp,
         jacrev=jacrev,
-        jacrev_row=jacrev_row,
         n_args=n,
         n_outputs=m,
     )
@@ -683,12 +549,6 @@ def lazy_derivative(func: Callable, mode: str) -> Callable:
                     f"got {len(args)} arguments"
                 )
             primal = tuple(args[0])
-        elif mode in ("jacfwd_column", "jacrev_row"):
-            if len(args) != n + 1:
-                raise TypeError(
-                    f"expected {n} primal arguments and one index, got {len(args)}"
-                )
-            primal = args[:-1]
         else:
             primal = args
         if len(primal) != n:

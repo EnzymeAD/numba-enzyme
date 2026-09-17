@@ -43,7 +43,7 @@ def _differentiate(func, mode, signature, cc):
     func : callable
         Annotated CPU function or CUDA device dispatcher to differentiate.
     mode : str
-        Name of the derivative, such as ``"grad"`` or ``"jacfwd_column"``.
+        Name of the derivative, such as ``"grad"`` or ``"jacfwd"``.
     signature : object or None
         Concrete CUDA specialization, or `None`.
     cc : tuple of int or None
@@ -185,6 +185,13 @@ def jvp(func: Callable, *, signature=None, cc=None) -> Callable:
     several sets write a matrix, one row each, and `jacfwd` is that same loop
     with the identity supplied internally.
 
+    A direction the compiler can see folds. The CUDA derivative links as LTO
+    IR, so nvJitLink inlines it before constant propagation: a unit direction
+    spelled out as literals at the call site kills the tangent arithmetic of
+    every zero component and collapses the sweep to the one column that
+    survives. Asking for a single column therefore needs no separate endpoint,
+    only a literal seed.
+
     A CUDA derivative is also a valid primal: ``jvp(jvp(f))`` is the
     second-order forward sweep, and every endpoint composes over a `jvp`. The
     chain is recorded rather than applied -- an already-built derivative is an
@@ -288,49 +295,10 @@ def jacrev(func: Callable, *, signature=None, cc=None) -> Callable:
 
     See Also
     --------
-    jacrev_row : One runtime-selected row of the same Jacobian.
     vjp : A reverse-mode product with an arbitrary output cotangent.
     jacfwd : The forward-mode counterpart.
     """
     return _differentiate(func, "jacrev", signature, cc)
-
-
-def jacrev_row(func: Callable, *, signature=None, cc=None) -> Callable:
-    """
-    Return a callable computing one reverse-mode Jacobian row.
-
-    The returned CPU callable takes the primal arguments followed by a
-    zero-based output-row index and returns one derivative per input.
-
-    Parameters
-    ----------
-    func : callable
-        A CPU function returning a scalar or fixed homogeneous
-        tuple, or a CUDA device dispatcher.
-    signature : numba_cuda_mlir.typing.Signature, optional
-        Concrete CUDA specialization every call site must resolve to. CUDA
-        argument types are otherwise inferred at each call site. Invalid for
-        CPU functions.
-    cc : tuple of int, optional
-        CUDA compute capability. Invalid for CPU functions.
-
-    Returns
-    -------
-    callable
-        A host callable ``(*args, row)`` returning the selected Jacobian row.
-
-    Raises
-    ------
-    TypeError
-        If CUDA-only options are passed for a CPU function.
-
-    See Also
-    --------
-    jacrev : The complete reverse-mode Jacobian.
-    vjp : A reverse-mode product with an arbitrary output cotangent.
-    jacfwd_column : The corresponding forward-mode column operation.
-    """
-    return _differentiate(func, "jacrev_row", signature, cc)
 
 
 def jacfwd(func: Callable, *, signature=None, cc=None) -> Callable:
@@ -359,8 +327,10 @@ def jacfwd(func: Callable, *, signature=None, cc=None) -> Callable:
         jac(jacobian, x0, x1)
 
     On a GPU ``jacobian`` costs ``n_out * n_args`` per thread, which stops
-    being viable well before the dimensions `jacfwd_column` handles
-    comfortably; prefer that when the whole matrix need not exist at once.
+    being viable well before the dimensions a sweep at a time handles
+    comfortably; prefer `jvp` when the whole matrix need not exist at once. A
+    unit direction spelled out at the call site folds, so asking for one
+    column that way costs one column.
 
     Parameters
     ----------
@@ -391,78 +361,9 @@ def jacfwd(func: Callable, *, signature=None, cc=None) -> Callable:
 
     See Also
     --------
-    jacfwd_column : One column of the same Jacobian, chosen at run time.
     jvp : Forward derivative of a scalar-output primal.
     """
     return _differentiate(func, "jacfwd", signature, cc)
-
-
-def jacfwd_column(func: Callable, *, signature=None, cc=None) -> Callable:
-    """
-    Return a callable computing one forward-mode Jacobian column.
-
-    For a CPU function, the returned callable takes the primal
-    arguments followed by the zero-based column index. It returns the selected
-    partial derivative for a scalar result::
-
-        def f(x: Float64, y: Float64) -> Float64:
-            return x * y
-
-        jacfwd_column(f)(2.0, 3.0, 1)  # 2.0
-
-    For a fixed-size homogeneous tuple result it returns that column as a
-    tuple, with one derivative per output component.
-
-    For CUDA the unit seed is built inside the derivative -- one ``select``
-    per argument, no branching -- so the caller likewise passes an integer
-    rather than a tangent vector it would have to materialise::
-
-        col = jacfwd_column(f)
-        # inside CUDA-compiled code:
-        col(column, x0, x1, 1)   # column = d f / d x1
-
-    Because the seed is data rather than code, every column runs the identical
-    instruction stream and costs the same, which is what lets a warp's lanes
-    take different columns without diverging.
-
-    ``column`` receives the requested column and must hold ``n_out`` elements
-    of the primal's dtype. The primal values do not cross the call: a
-    tuple-returning primal hands Enzyme a struct, so the marker returns the
-    tangent struct directly.
-
-    Parameters
-    ----------
-    func : callable
-        A CPU function returning a scalar or fixed homogeneous
-        tuple, or a
-        ``@cuda.jit(device=True)`` dispatcher of the shape
-        ``UniTuple(dtype, n)(x0, ..., xn)``.
-    signature : numba_cuda_mlir.typing.Signature, optional
-        Concrete CUDA specialization every call site must resolve to. CUDA
-        argument types are otherwise inferred at each call site. Invalid for
-        CPU functions.
-    cc : tuple of int, optional
-        CUDA compute capability as ``(major, minor)``. Defaults to the current
-        device's.
-
-    Returns
-    -------
-    callable
-        For CPU, a host callable ``(*args, index)`` returning one scalar or a
-        tuple column. For CUDA, a device callable ``(column, *args, index)``
-        returning nothing.
-
-    Raises
-    ------
-    TypeError
-        If CUDA-only options are passed for a CPU function.
-
-    See Also
-    --------
-    jacfwd : The whole Jacobian, one sweep per column.
-    jvp : Forward derivative of a scalar-output primal.
-    """
-    return _differentiate(func, "jacfwd_column", signature, cc)
 
 
 def _cached_transform(transform: Callable) -> functools.cached_property:
@@ -531,8 +432,8 @@ class Differentiable:
     Calling an instance runs the original Python code directly. Its derivative
     callables are built and cached on first access, so decorating a function
     costs nothing until it is actually differentiated. The available
-    attributes are ``.grad``, ``.jvp``, ``.vjp``, ``.jacfwd``,
-    ``.jacfwd_column``, ``.jacrev``, and ``.jacrev_row``.
+    attributes are ``.grad``, ``.jvp``, ``.vjp``, ``.jacfwd``, and
+    ``.jacrev``.
 
     Parameters
     ----------
@@ -570,9 +471,7 @@ class Differentiable:
     jvp = _cached_transform(jvp)
     vjp = _cached_transform(vjp)
     jacfwd = _cached_transform(jacfwd)
-    jacfwd_column = _cached_transform(jacfwd_column)
     jacrev = _cached_transform(jacrev)
-    jacrev_row = _cached_transform(jacrev_row)
 
 
 def differentiable(func: Callable) -> Differentiable:
@@ -597,10 +496,8 @@ def differentiable(func: Callable) -> Differentiable:
     grad : The standalone equivalent of `.grad`.
     jvp : The standalone equivalent of `.jvp`.
     jacfwd : The standalone equivalent of `.jacfwd`.
-    jacfwd_column : The standalone equivalent of `.jacfwd_column`.
     vjp : The standalone equivalent of `.vjp`.
     jacrev : The standalone equivalent of `.jacrev`.
-    jacrev_row : The standalone equivalent of `.jacrev_row`.
 
     Examples
     --------

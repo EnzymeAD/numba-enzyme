@@ -108,8 +108,6 @@ def test_forward_jacobian_matches_analytic(func, analytic_grad):
     analytic = analytic_grad(*xs)
 
     assert diff.jacfwd(*xs) == pytest.approx(analytic, abs=1e-9)
-    for column, expected in enumerate(analytic):
-        assert diff.jacfwd_column(*xs, column) == pytest.approx(expected, abs=1e-9)
 
 
 @pytest.mark.parametrize("func,analytic_grad", _CASES)
@@ -123,7 +121,6 @@ def test_reverse_products_and_jacobian_match_analytic(func, analytic_grad):
         tuple(2 * value for value in analytic), abs=1e-9
     )
     assert diff.jacrev(*xs) == pytest.approx(analytic, abs=1e-9)
-    assert diff.jacrev_row(*xs, 0) == pytest.approx(analytic, abs=1e-9)
 
 
 @pytest.mark.parametrize("func", [h1, h2, h3, h4])

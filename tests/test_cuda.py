@@ -9,9 +9,7 @@ from numba_cuda_mlir import cuda, types
 from numba_enzyme.core import (
     grad,
     jacfwd,
-    jacfwd_column,
     jacrev,
-    jacrev_row,
     jvp,
     vjp,
 )
@@ -142,12 +140,11 @@ def test_device_signatures_match_public_grad_and_jvp_shapes():
         (types.float64, types.float64), types.float64, "scalar"
     )
     # The jacfwd shapes need a tuple-returning primal, so a scalar one has none.
-    assert set(signatures) == {"grad", "jvp", "vjp", "jacrev", "jacrev_row"}
+    assert set(signatures) == {"grad", "jvp", "vjp", "jacrev"}
     grad_sig = signatures["grad"]
     jvp_sig = signatures["jvp"]
     vjp_sig = signatures["vjp"]
     jacrev_sig = signatures["jacrev"]
-    row_sig = signatures["jacrev_row"]
     assert grad_sig.return_type == types.UniTuple(types.float64, 2)
     assert grad_sig.args == (types.float64, types.float64)
     assert jvp_sig.args == (
@@ -161,7 +158,6 @@ def test_device_signatures_match_public_grad_and_jvp_shapes():
     )
     assert vjp_sig.return_type == types.UniTuple(types.float64, 2)
     assert jacrev_sig == grad_sig
-    assert row_sig.args == (*grad_sig.args, types.int32)
 
 
 def test_nvvm_sanitizer_rewrites_enzyme_math_and_new_attributes():
@@ -205,7 +201,6 @@ def test_core_returns_lazy_cuda_derivatives_without_compiling(monkeypatch):
     jf = jvp(unannotated_device, cc=(8, 0))
     vf = vjp(unannotated_device, cc=(8, 0))
     jr = jacrev(unannotated_device, cc=(8, 0))
-    row = jacrev_row(unannotated_device, cc=(8, 0))
 
     assert df._numba_enzyme_primal is unannotated_device
     assert df._numba_enzyme_mode == "grad"
@@ -213,20 +208,17 @@ def test_core_returns_lazy_cuda_derivatives_without_compiling(monkeypatch):
     assert jf._numba_enzyme_mode == "jvp"
     assert vf._numba_enzyme_mode == "vjp"
     assert jr._numba_enzyme_mode == "jacrev"
-    assert row._numba_enzyme_mode == "jacrev_row"
 
     # Tuple-returning primals need no signature either; one only constrains.
     tuple_signature = types.UniTuple(types.float64, 2)(types.float64, types.float64)
-    for builder in (jacfwd, jacfwd_column, vjp, jacrev, jacrev_row):
+    for builder in (jacfwd, jvp, vjp, jacrev):
         for options in ({}, {"signature": tuple_signature}):
             lazy = builder(tuple_device, cc=(8, 0), **options)
             assert lazy._numba_enzyme_primal is tuple_device
             assert lazy._numba_enzyme_mode == builder.__name__
 
 
-@pytest.mark.parametrize(
-    "builder", [grad, jvp, jacfwd, jacfwd_column, vjp, jacrev, jacrev_row]
-)
+@pytest.mark.parametrize("builder", [grad, jvp, jacfwd, vjp, jacrev])
 def test_cpu_functions_reject_cuda_only_options(builder):
     def cpu_function(x: Float32) -> Float32:
         return x * x
@@ -264,15 +256,13 @@ def test_scalar_reverse_apis_type_inside_device_code_offline():
 
     product = vjp(unannotated_device, cc=(8, 0))
     whole = jacrev(unannotated_device, cc=(8, 0))
-    row = jacrev_row(unannotated_device, cc=(8, 0))
-    namespace = {"product": product, "whole": whole, "row": row}
+    namespace = {"product": product, "whole": whole}
     exec(  # noqa: S102 - fixed test source
         compile(
             "def use(x, y):\n"
             "    a, b = product((x, y), 2.0)\n"
             "    c, d = whole(x, y)\n"
-            "    e, g = row(x, y, 0)\n"
-            "    return a + b + c + d + e + g\n",
+            "    return a + b + c + d\n",
             "<numba-enzyme-reverse-caller>",
             "exec",
         ),
@@ -347,7 +337,6 @@ def test_scalar_cuda_reverse_apis_execute_on_device():
     cc = cuda.get_current_device().compute_capability
     product = vjp(unannotated_device, cc=cc)
     whole = jacrev(unannotated_device, cc=cc)
-    one = jacrev_row(unannotated_device, cc=cc)
 
     @cuda.jit
     def kernel(x, y, cotangent, products, jacobians, rows):
@@ -355,7 +344,8 @@ def test_scalar_cuda_reverse_apis_execute_on_device():
         if i < x.size:
             products[i, 0], products[i, 1] = product((x[i], y[i]), cotangent[i])
             jacobians[i, 0], jacobians[i, 1] = whole(x[i], y[i])
-            rows[i, 0], rows[i, 1] = one(x[i], y[i], 0)
+            # A unit cotangent is the Jacobian's row, and costs the same sweep.
+            rows[i, 0], rows[i, 1] = product((x[i], y[i]), 1.0)
 
     x = np.asarray([1.0, 2.0, 3.0])
     y = np.asarray([0.5, 1.5, 2.5])
@@ -526,14 +516,7 @@ def test_tuple_reverse_signatures_and_driver_shapes():
     # grad needs a scalar-return primal. jvp and jvp2 are directional, so their
     # result is the whole tangent and a tuple-returning primal supports them,
     # through the array call shape the other tuple modes use.
-    assert set(signatures) == {
-        "jacfwd",
-        "jacfwd_column",
-        "jvp",
-        "vjp",
-        "jacrev",
-        "jacrev_row",
-    }
+    assert set(signatures) == {"jacfwd", "jvp", "vjp", "jacrev"}
     # (tangent, x0, x1, d0, d1): the direction set mirrors the primal's own
     # arguments. Each composition level doubles that, since it differentiates
     # the level below with respect to all of its arguments.
@@ -551,7 +534,6 @@ def test_tuple_reverse_signatures_and_driver_shapes():
         types.float64,
         types.float64,
     )
-    assert signatures["jacrev_row"].args[-1] == types.int32
 
     kernel = CUDALoweredKernel(
         ir=(
@@ -564,20 +546,18 @@ def test_tuple_reverse_signatures_and_driver_shapes():
         compute_capability=(8, 0),
         fastmath=False,
     )
-    driver = synthesise_cuda(kernel, "test", modes=("vjp", "jacrev", "jacrev_row"))
+    driver = synthesise_cuda(kernel, "test", modes=("vjp", "jacrev"))
     assert driver.symbols == {
         "vjp": ("numba_enzyme_vjp_test",),
         "jacrev": ("numba_enzyme_jacrev_test",),
-        "jacrev_row": ("numba_enzyme_jacrevrow_test",),
     }
     assert "__enzyme_fwddiff" not in driver.ir
-    assert driver.ir.count("__enzyme_autodiff") == 4  # declaration + three calls
+    assert driver.ir.count("__enzyme_autodiff") == 3  # declaration + two calls
     # The reverse sweeps differentiate the internal scalarisation, not the
-    # primal, and the gradient is the only buffer that crosses jacrev_row.
+    # primal, and only the buffers the caller reads back cross the entry point.
     assert 'define internal double @"numba_enzyme_scalarised_test"' in driver.ir
     assert (
-        'define void @"numba_enzyme_jacrevrow_test"(i8* %"gradient_allocated"'
-        in driver.ir
+        'define void @"numba_enzyme_vjp_test"(i8* %"cotangent_allocated"' in driver.ir
     )
 
 
@@ -590,13 +570,12 @@ def test_offline_tuple_reverse_pipeline_emits_linkable_lto_ir():
         tuple_device,
         signature=signature,
         cc=(8, 0),
-        modes=("vjp", "jacrev", "jacrev_row"),
+        modes=("vjp", "jacrev"),
     )
     assert built.code[:4] == b"\xedCN\x7f"
     assert built.shape == "tuple"
     assert built.symbols["vjp"][0].startswith("numba_enzyme_vjp_")
     assert built.symbols["jacrev"][0].startswith("numba_enzyme_jacrev_")
-    assert built.symbols["jacrev_row"][0].startswith("numba_enzyme_jacrevrow_")
 
 
 def test_offline_tuple_pipeline_types_inside_device_code():
@@ -607,17 +586,16 @@ def test_offline_tuple_pipeline_types_inside_device_code():
 
     signature = types.UniTuple(types.float64, 2)(types.float64, types.float64)
     built = build_cuda(
-        tuple_device, signature=signature, cc=(8, 0), modes=("jacfwd", "jacfwd_column")
+        tuple_device, signature=signature, cc=(8, 0), modes=("jacfwd", "jvp")
     )
     assert built.code[:4] == b"\xedCN\x7f"
     assert built.symbols["jacfwd"][0].startswith("numba_enzyme_jacfwd_")
-    assert built.symbols["jacfwd_column"][0].startswith("numba_enzyme_jacfwdcol_")
+    assert built.symbols["jvp"][0].startswith("numba_enzyme_jvp_")
 
     whole = jacfwd(tuple_device, cc=(8, 0))
-    column = jacfwd_column(tuple_device, cc=(8, 0))
+    sweep = jvp(tuple_device, cc=(8, 0))
     product = vjp(tuple_device, cc=(8, 0))
     reverse = jacrev(tuple_device, cc=(8, 0))
-    row = jacrev_row(tuple_device, cc=(8, 0))
 
     @cuda.jit(device=True)
     def caller(x, y):
@@ -626,10 +604,9 @@ def test_offline_tuple_pipeline_types_inside_device_code():
         gradient = cuda.local.array(2, types.float64)
         jacobian = cuda.local.array((2, 2), types.float64)
         whole(jacobian, x, y)
-        column(col, x, y, 1)
+        sweep(col, x, y, 0.0, 1.0)
         product(cotangent, gradient, x, y)
         reverse(jacobian, x, y)
-        row(gradient, x, y, 0)
         return jacobian[0, 0] + col[1] + gradient[0]
 
     lowered = lower_cuda(
@@ -671,39 +648,12 @@ def test_lazy_cuda_call_shape_errors_name_the_mismatch():
         lower_cuda(wrong_arity, signature=scalar_signature, cc=(8, 0))
 
 
-def test_jacfwd_column_driver_takes_an_index_not_a_tangent():
-    """The seed is built inside, so a wide primal marshals far fewer arguments."""
-
-    kernel = CUDALoweredKernel(
-        ir=(
-            'target triple = "nvptx64-nvidia-cuda"\n'
-            'target datalayout = "e-p:64:64:64-i64:64-n16:32:64"\n'
-        ),
-        entry_symbol="primal",
-        arg_types=(types.float64, types.float64),
-        return_type=types.UniTuple(types.float64, 2),
-        compute_capability=(8, 0),
-        fastmath=False,
-    )
-    driver = synthesise_cuda(kernel, "test", modes=("jacfwd_column",))
-
-    assert driver.symbols["jacfwd_column"] == ("numba_enzyme_jacfwdcol_test",)
-    # One memref, the primal's scalars, and one index -- no tangent vector, and
-    # no output array, since the primal returns its values in a struct.
-    assert (
-        'define void @"numba_enzyme_jacfwdcol_test"('
-        'i8* %"column_allocated", i8* %"column_aligned", i64 %"column_offset", '
-        'i64 %"column_size", i64 %"column_stride", '
-        'double %"x0", double %"x1", i32 %"column")' in driver.ir
-    )
-    # One sweep, and the unit seed is a select per argument rather than a branch.
-    assert driver.ir.count("__enzyme_fwddiff") == 2  # declare + one call
-    assert len(re.findall(r"select\s+i1", driver.ir)) == 2
-    assert "br " not in driver.ir
-
-
 def test_jacfwd_shapes_agree_column_by_column():
-    """The two shapes must be the same derivative, differently arranged."""
+    """The two shapes must be the same derivative, differently arranged.
+
+    `jacfwd` supplies the identity internally; a unit direction spelled out at
+    the call site asks for one of those same columns.
+    """
 
     if not cuda.is_available():
         pytest.skip("a CUDA GPU is not available")
@@ -713,7 +663,7 @@ def test_jacfwd_shapes_agree_column_by_column():
     signature = types.UniTuple(types.float64, 2)(types.float64, types.float64)
     # One explicitly constrained and one inferred, so both paths must agree.
     whole = jacfwd(tuple_device, signature=signature, cc=cc)
-    column = jacfwd_column(tuple_device, cc=cc)
+    sweep = jvp(tuple_device, cc=cc)
 
     @cuda.jit
     def kernel(x, y, from_whole, from_columns):
@@ -723,10 +673,10 @@ def test_jacfwd_shapes_agree_column_by_column():
         for r in range(2):
             for c in range(2):
                 from_whole[r, c] = jac[r, c]
-        for c in range(2):
-            column(col, x[0], y[0], c)
-            for r in range(2):
-                from_columns[r, c] = col[r]
+        sweep(col, x[0], y[0], 1.0, 0.0)
+        from_columns[0, 0], from_columns[1, 0] = col[0], col[1]
+        sweep(col, x[0], y[0], 0.0, 1.0)
+        from_columns[0, 1], from_columns[1, 1] = col[0], col[1]
 
     a = cuda.device_array((2, 2), dtype=np.float64)
     b = cuda.device_array((2, 2), dtype=np.float64)
@@ -768,24 +718,20 @@ def test_wide_scalar_cuda_derivatives_execute_on_device():
     primal = _wide_device_function(n, shape="scalar")
     xs = ", ".join(f"x[{i}]" for i in range(n))
     kernel = _wide_kernel(
-        "def kernel(x, gradient, row, product):\n"
+        "def kernel(x, gradient, product):\n"
         f"    g = df({xs})\n"
-        f"    r = one({xs}, 0)\n"
         f"    p = vf(({xs}), 2.0)\n"
         f"    for i in range({n}):\n"
         "        gradient[i] = g[i]\n"
-        "        row[i] = r[i]\n"
         "        product[i] = p[i]\n",
         df=grad(primal),
-        one=jacrev_row(primal),
         vf=vjp(primal),
     )
     x = 1.0 + 0.01 * np.arange(n)
-    gradient, row, product = (cuda.device_array(n, dtype=np.float64) for _ in range(3))
-    kernel[1, 1](cuda.to_device(x), gradient, row, product)
+    gradient, product = (cuda.device_array(n, dtype=np.float64) for _ in range(2))
+    kernel[1, 1](cuda.to_device(x), gradient, product)
 
     np.testing.assert_allclose(gradient.copy_to_host(), 2 * x, rtol=1e-12)
-    np.testing.assert_allclose(row.copy_to_host(), 2 * x, rtol=1e-12)
     np.testing.assert_allclose(product.copy_to_host(), 4 * x, rtol=1e-12)
 
 
@@ -816,12 +762,14 @@ def test_device_signatures_for_a_tuple_primal():
         scalars, types.UniTuple(types.float64, 2), shape="tuple"
     )
 
-    # No output array and no work buffer: only results cross the call.
-    assert signatures["jacfwd_column"].args == (
+    # No output array and no work buffer: only results cross the call. A
+    # direction set mirrors the primal's own arguments.
+    assert signatures["jvp"].args == (
         types.float64[::1],
         types.float64,
         types.float64,
-        types.int32,
+        types.float64,
+        types.float64,
     )
     assert signatures["jacfwd"].args == (
         types.float64[:, ::1],
@@ -851,15 +799,15 @@ def test_tuple_externals_are_named_from_the_cache_key():
 
     signature = types.UniTuple(types.float64, 2)(types.float64, types.float64)
     built = differentiate_cuda(
-        tuple_device, signature=signature, cc=(8, 0), modes=("jacfwd_column",)
+        tuple_device, signature=signature, cc=(8, 0), modes=("jvp",)
     )
-    external = built.externals["jacfwd_column"]
+    external = built.externals["jvp"]
 
-    assert external.name.startswith("numba_enzyme_jacfwdcol_")
+    assert external.name.startswith("numba_enzyme_jvp_")
     again = differentiate_cuda(
-        tuple_device, signature=signature, cc=(8, 0), modes=("jacfwd_column",)
+        tuple_device, signature=signature, cc=(8, 0), modes=("jvp",)
     )
-    assert again.externals["jacfwd_column"].name == external.name
+    assert again.externals["jvp"].name == external.name
 
 
 def test_tuple_forward_apis_execute_on_device():
@@ -868,7 +816,7 @@ def test_tuple_forward_apis_execute_on_device():
     _require_numba_cuda_mlir_compiler()
 
     cc = cuda.get_current_device().compute_capability
-    column = jacfwd_column(tuple_device, cc=cc)
+    sweep = jvp(tuple_device, cc=cc)
     whole = jacfwd(tuple_device, cc=cc)
 
     @cuda.jit
@@ -877,10 +825,10 @@ def test_tuple_forward_apis_execute_on_device():
         if i < x.size:
             col = cuda.local.array(2, types.float64)
             jac = cuda.local.array((2, 2), types.float64)
-            for c in range(2):
-                column(col, x[i], y[i], c)
-                by_column[i, 0, c] = col[0]
-                by_column[i, 1, c] = col[1]
+            sweep(col, x[i], y[i], 1.0, 0.0)
+            by_column[i, 0, 0], by_column[i, 1, 0] = col[0], col[1]
+            sweep(col, x[i], y[i], 0.0, 1.0)
+            by_column[i, 0, 1], by_column[i, 1, 1] = col[0], col[1]
             whole(jac, x[i], y[i])
             for r in range(2):
                 for c in range(2):
@@ -904,7 +852,6 @@ def test_tuple_reverse_apis_execute_on_device():
 
     cc = cuda.get_current_device().compute_capability
     product = vjp(tuple_device, cc=cc)
-    one_row = jacrev_row(tuple_device, cc=cc)
     whole = jacrev(tuple_device, cc=cc)
 
     @cuda.jit
@@ -920,7 +867,9 @@ def test_tuple_reverse_apis_execute_on_device():
             products[i, 0] = gradient[0]
             products[i, 1] = gradient[1]
             for r in range(2):
-                one_row(gradient, x[i], y[i], r)
+                cotangent[0] = 1.0 if r == 0 else 0.0
+                cotangent[1] = 0.0 if r == 0 else 1.0
+                product(cotangent, gradient, x[i], y[i])
                 rows[i, r, 0] = gradient[0]
                 rows[i, r, 1] = gradient[1]
             whole(jac, x[i], y[i])
@@ -961,16 +910,17 @@ def test_tuple_primal_with_one_output():
     _require_numba_cuda_mlir_compiler()
 
     cc = cuda.get_current_device().compute_capability
-    column = jacfwd_column(single_output_device, cc=cc)
+    sweep = jvp(single_output_device, cc=cc)
 
     @cuda.jit
     def kernel(x, y, out):
         i = cuda.grid(1)
         if i < x.size:
             col = cuda.local.array(1, types.float64)
-            for c in range(2):
-                column(col, x[i], y[i], c)
-                out[i, c] = col[0]
+            sweep(col, x[i], y[i], 1.0, 0.0)
+            out[i, 0] = col[0]
+            sweep(col, x[i], y[i], 0.0, 1.0)
+            out[i, 1] = col[0]
 
     x = np.asarray([1.0, 2.0, 3.0])
     y = np.asarray([0.5, 1.5, 2.5])
@@ -989,12 +939,14 @@ def test_wide_tuple_cuda_derivatives_execute_on_device():
     n = 32
     primal = _wide_device_function(n, shape="tuple")
     xs = ", ".join(f"x[{i}]" for i in range(n))
+    # The unit direction picking column 5, spelled out at the call site.
+    seed = ", ".join("1.0" if i == 5 else "0.0" for i in range(n))
     kernel = _wide_kernel(
         "def kernel(x, column, gradient):\n"
         "    col = cuda.local.array(2, types.float64)\n"
         "    cotangent = cuda.local.array(2, types.float64)\n"
         f"    grad = cuda.local.array({n}, types.float64)\n"
-        f"    one(col, {xs}, 5)\n"
+        f"    one(col, {xs}, {seed})\n"
         "    column[0] = col[0]\n"
         "    column[1] = col[1]\n"
         "    cotangent[0] = 2.0\n"
@@ -1002,7 +954,7 @@ def test_wide_tuple_cuda_derivatives_execute_on_device():
         f"    vf(cotangent, grad, {xs})\n"
         f"    for i in range({n}):\n"
         "        gradient[i] = grad[i]\n",
-        one=jacfwd_column(primal),
+        one=jvp(primal),
         vf=vjp(primal),
     )
     x = 1.0 + 0.01 * np.arange(n)
@@ -1047,12 +999,14 @@ def test_tuple_arguments_are_valid_and_mirror_the_call_shape():
     # A tuple argument becomes an array, of any layout since the entry point
     # reads it through its stride; a scalar argument stays put. The buffers
     # the derivative writes stay contiguous.
-    assert signatures["jacfwd_column"].args == (
+    assert signatures["jvp"].args == (
         types.float64[::1],
         types.float64[:],
         types.float64,
         types.float64[:],
-        types.int32,
+        types.float64[:],
+        types.float64,
+        types.float64[:],
     )
     assert signatures["vjp"].args == (
         types.float64[::1],
@@ -1082,22 +1036,29 @@ def test_tuple_argument_driver_takes_arrays_not_a_scalar_per_element():
         compute_capability=(8, 0),
         fastmath=False,
     )
-    driver = synthesise_cuda(kernel, "test", modes=("jacfwd_column",))
+    driver = synthesise_cuda(kernel, "test", modes=("jvp",))
 
-    # column memref, ys memref, the loose scalar t, ps memref, then the index.
+    # tangent memref, ys memref, the loose scalar t, ps memref, then a
+    # direction set shaped exactly like those three arguments.
     assert (
-        'define void @"numba_enzyme_jacfwdcol_test"('
-        'i8* %"column_allocated", i8* %"column_aligned", i64 %"column_offset", '
-        'i64 %"column_size", i64 %"column_stride", '
+        'define void @"numba_enzyme_jvp_test"('
+        'i8* %"tangent_allocated", i8* %"tangent_aligned", i64 %"tangent_offset", '
+        'i64 %"tangent_size", i64 %"tangent_stride", '
         'i8* %"x0_allocated", i8* %"x0_aligned", i64 %"x0_offset", '
         'i64 %"x0_size", i64 %"x0_stride", '
         'double %"x1", '
         'i8* %"x2_allocated", i8* %"x2_aligned", i64 %"x2_offset", '
-        'i64 %"x2_size", i64 %"x2_stride", i32 %"column")' in driver.ir
+        'i64 %"x2_size", i64 %"x2_stride", '
+        'i8* %"s0_0_0_allocated", i8* %"s0_0_0_aligned", i64 %"s0_0_0_offset", '
+        'i64 %"s0_0_0_size", i64 %"s0_0_0_stride", '
+        'double %"s0_0_1", '
+        'i8* %"s0_0_2_allocated", i8* %"s0_0_2_aligned", i64 %"s0_0_2_offset", '
+        'i64 %"s0_0_2_size", i64 %"s0_0_2_stride")' in driver.ir
     )
-    # Still one sweep, and one seed select per flat scalar, not per argument.
+    # One sweep, and the seed is loaded rather than selected for: a caller that
+    # wants a column spells the direction out and the loads fold away.
     assert driver.ir.count("__enzyme_fwddiff") == 2
-    assert len(re.findall(r"select\s+i1", driver.ir)) == 4
+    assert not re.findall(r"select\s+i1", driver.ir)
 
 
 def test_tuple_argument_derivative_executes_on_device():
@@ -1106,26 +1067,33 @@ def test_tuple_argument_derivative_executes_on_device():
     _require_numba_cuda_mlir_compiler()
 
     cc = cuda.get_current_device().compute_capability
-    column = jacfwd_column(
-        tuple_argument_device, signature=_TUPLE_ARGUMENT_SIGNATURE, cc=cc
-    )
+    sweep = jvp(tuple_argument_device, signature=_TUPLE_ARGUMENT_SIGNATURE, cc=cc)
 
     @cuda.jit
-    def kernel(ys, t, ps, jacobian):
+    def kernel(ys, t, ps, direction, jacobian):
         i = cuda.grid(1)
         if i < ys.shape[0]:
             col = cuda.local.array(2, types.float64)
-            # Five arguments whatever the tuple lengths are.
+            # Seven arguments whatever the tuple lengths are: the direction
+            # mirrors the primal's own, so a state column is a row of `ys`.
             for c in range(2):
-                column(col, ys[i], t, ps[i], c)
+                sweep(col, ys[i], t, ps[i], direction[c], 0.0, direction[2])
                 jacobian[i, 0, c] = col[0]
                 jacobian[i, 1, c] = col[1]
 
     ys = np.asarray([[1.0, 2.0], [3.0, 4.0]])
     ps = np.asarray([[0.5], [1.5]])
     t = 0.25
+    # Rows 0 and 1 are the state's unit directions; row 2 is the null one.
+    direction = np.asarray([[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]])
     d_jacobian = cuda.device_array((2, 2, 2), dtype=np.float64)
-    kernel[1, 32](cuda.to_device(ys), t, cuda.to_device(ps), d_jacobian)
+    kernel[1, 32](
+        cuda.to_device(ys),
+        t,
+        cuda.to_device(ps),
+        cuda.to_device(direction),
+        d_jacobian,
+    )
 
     # d(y0 * p0) = (p0, 0); d(y1 + t) = (0, 1)
     expected = np.stack([np.asarray([[ps[i, 0], 0.0], [0.0, 1.0]]) for i in range(2)])
@@ -1136,15 +1104,15 @@ def test_a_tuple_argument_call_must_pass_an_array():
     _require_numba_cuda_mlir_compiler()
     from numba_enzyme.cuda import lower_cuda
 
-    column = jacfwd_column(
-        tuple_argument_device, signature=_TUPLE_ARGUMENT_SIGNATURE, cc=(8, 0)
-    )
+    sweep = jvp(tuple_argument_device, signature=_TUPLE_ARGUMENT_SIGNATURE, cc=(8, 0))
 
     @cuda.jit(device=True)
     def caller(x, y):
         col = cuda.local.array(2, types.float64)
         ps = cuda.local.array(1, types.float64)
-        column(col, x, y, ps, 0)  # x is a scalar where a state array belongs
+        seed = cuda.local.array(2, types.float64)
+        # x is a scalar where a state array belongs
+        sweep(col, x, y, ps, seed, 0.0, ps)
         return col[0]
 
     with pytest.raises(Exception, match="wants a contiguous array there"):
@@ -1348,3 +1316,171 @@ def test_reverse_endpoints_compose_over_a_forward_level():
     np.testing.assert_allclose(
         by_row.copy_to_host(), by_column.copy_to_host(), rtol=1e-9
     )
+
+
+@cuda.jit(device=True)
+def _seed_primal(x0, x1, x2, x3, x4, x5, x6, x7):
+    """Eight in, eight out, cheap enough that the seed is a real fraction.
+
+    Every output uses three of the inputs, so every column of the Jacobian
+    covers the same amount of work and no column is a special case.
+    """
+
+    return (
+        x0 * x1 + 2.0 * x2 * x0,
+        x1 * x2 + 2.0 * x3 * x1,
+        x2 * x3 + 2.0 * x4 * x2,
+        x3 * x4 + 2.0 * x5 * x3,
+        x4 * x5 + 2.0 * x6 * x4,
+        x5 * x6 + 2.0 * x7 * x5,
+        x6 * x7 + 2.0 * x0 * x6,
+        x7 * x0 + 2.0 * x1 * x7,
+    )
+
+
+def _fastest_launch(kernel, args, grid, block, runs=7):
+    """Return the shortest of `runs` timed launches, in milliseconds."""
+
+    kernel[grid, block](*args)  # compile, and warm the device up
+    cuda.synchronize()
+    times = []
+    for _ in range(runs):
+        start, stop = cuda.event(), cuda.event()
+        start.record()
+        kernel[grid, block](*args)
+        stop.record()
+        stop.synchronize()
+        times.append(cuda.event_elapsed_time(start, stop))
+    return min(times)
+
+
+def test_a_compile_time_jvp_direction_folds_and_is_faster():
+    """A literal direction beats the same direction read from memory.
+
+    The derivative links as LTO IR, so nvJitLink inlines it into its caller
+    before constant-propagating. A direction written as literals at the call
+    site therefore reaches the seed as constants: the seven zero components
+    kill their tangent arithmetic and the sweep collapses to the one column
+    that survives. The identical vector arriving in registers cannot fold, so
+    the whole sweep is emitted and the register footprint roughly doubles.
+
+    Both kernels compute the same numbers -- the host hands the run-time
+    kernel exactly the vector the other one spells out -- so the only
+    difference between them is whether the compiler can see it.
+
+    Each sweep feeds its result back into *every* primal argument. Without
+    that, a column whose partials happen not to involve the fed-back argument
+    is loop-invariant, and the timing measures a hoisted loop rather than a
+    folded sweep.
+    """
+
+    if not cuda.is_available():
+        pytest.skip("a CUDA GPU is not available")
+    _require_numba_cuda_mlir_compiler()
+
+    cc = cuda.get_current_device().compute_capability
+    tangent = jvp(_seed_primal, cc=cc)
+
+    @cuda.jit
+    def literal_seed(data, out, reps):
+        t = cuda.grid(1)
+        buf = cuda.local.array(8, types.float64)
+        x0, x1, x2, x3 = data[t, 0], data[t, 1], data[t, 2], data[t, 3]
+        x4, x5, x6, x7 = data[t, 4], data[t, 5], data[t, 6], data[t, 7]
+        acc = 0.0
+        for _ in range(reps):
+            tangent(
+                buf,
+                x0,
+                x1,
+                x2,
+                x3,
+                x4,
+                x5,
+                x6,
+                x7,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            s = 0.0
+            for r in range(8):
+                s += buf[r]
+            acc += s
+            x0, x1, x2, x3 = x0 + 1e-9 * s, x1 + 1e-9 * s, x2 + 1e-9 * s, x3 + 1e-9 * s
+            x4, x5, x6, x7 = x4 + 1e-9 * s, x5 + 1e-9 * s, x6 + 1e-9 * s, x7 + 1e-9 * s
+        out[t] = acc
+
+    @cuda.jit
+    def runtime_seed(data, direction, out, reps):
+        t = cuda.grid(1)
+        buf = cuda.local.array(8, types.float64)
+        x0, x1, x2, x3 = data[t, 0], data[t, 1], data[t, 2], data[t, 3]
+        x4, x5, x6, x7 = data[t, 4], data[t, 5], data[t, 6], data[t, 7]
+        # Hoisted out of the loop, so this times the seed rather than the
+        # memory traffic that delivered it.
+        d0, d1, d2, d3 = direction[0], direction[1], direction[2], direction[3]
+        d4, d5, d6, d7 = direction[4], direction[5], direction[6], direction[7]
+        acc = 0.0
+        for _ in range(reps):
+            tangent(
+                buf,
+                x0,
+                x1,
+                x2,
+                x3,
+                x4,
+                x5,
+                x6,
+                x7,
+                d0,
+                d1,
+                d2,
+                d3,
+                d4,
+                d5,
+                d6,
+                d7,
+            )
+            s = 0.0
+            for r in range(8):
+                s += buf[r]
+            acc += s
+            x0, x1, x2, x3 = x0 + 1e-9 * s, x1 + 1e-9 * s, x2 + 1e-9 * s, x3 + 1e-9 * s
+            x4, x5, x6, x7 = x4 + 1e-9 * s, x5 + 1e-9 * s, x6 + 1e-9 * s, x7 + 1e-9 * s
+        out[t] = acc
+
+    threads, block, reps = 1 << 19, 128, 32
+    grid = threads // block
+    data = cuda.to_device(0.5 + np.random.default_rng(0).random((threads, 8)))
+    direction = cuda.to_device(np.asarray([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    out = cuda.device_array(threads, dtype=np.float64)
+
+    literal_seed[grid, block](data, out, reps)
+    cuda.synchronize()
+    from_literal = out.copy_to_host()
+    runtime_seed[grid, block](data, direction, out, reps)
+    cuda.synchronize()
+    # Same derivative, same direction: folding must not have changed the answer.
+    np.testing.assert_allclose(from_literal, out.copy_to_host(), rtol=1e-12)
+
+    folded = _fastest_launch(literal_seed, (data, out, reps), grid, block)
+    unfolded = _fastest_launch(runtime_seed, (data, direction, out, reps), grid, block)
+
+    # 4.3x to 5.4x across the eight columns on an RTX 4070 SUPER, so 2x leaves
+    # room for a slower or busier device. A regression that stopped the seed
+    # folding would take the ratio to 1.
+    assert unfolded > 2.0 * folded, (
+        f"a literal direction took {folded:.3f} ms against {unfolded:.3f} ms "
+        f"for the same direction in registers, only {unfolded / folded:.2f}x: "
+        "the compile-time seed is no longer folding"
+    )
+    # Folding the seed away takes the live tangents with it.
+    folded_regs = next(iter(literal_seed.get_regs_per_thread().values()))
+    unfolded_regs = next(iter(runtime_seed.get_regs_per_thread().values()))
+    assert folded_regs < unfolded_regs

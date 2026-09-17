@@ -752,10 +752,8 @@ MODES = (
     "grad",
     "jvp",
     "jacfwd",
-    "jacfwd_column",
     "vjp",
     "jacrev",
-    "jacrev_row",
 )
 
 # Forward Jacobians need a primal with several outputs, which means a
@@ -766,31 +764,27 @@ MODES = (
 # directional derivative -- but only for a tuple-returning primal, because only
 # the array call shape can carry the extra direction sets.
 SCALAR_ONLY_MODES = frozenset({"grad"})
-TUPLE_ONLY_MODES = frozenset({"jacfwd", "jacfwd_column"})
-TUPLE_FORWARD_MODES = frozenset({"jacfwd", "jacfwd_column", "jvp"})
-REVERSE_MODES = frozenset({"vjp", "jacrev", "jacrev_row"})
+TUPLE_ONLY_MODES = frozenset({"jacfwd"})
+TUPLE_FORWARD_MODES = frozenset({"jacfwd", "jvp"})
+REVERSE_MODES = frozenset({"vjp", "jacrev"})
 # What `modes=None` means: the original scalar-return defaults.
 DEFAULT_MODES = frozenset({"grad", "jvp"})
 
 # Leading array arguments of each tuple-primal call shape, before the primal's
-# scalars, and whether a row or column selector follows them. A tuple-returning
-# primal needs no output array, so neither the primal values nor a shadow work
-# buffer cross the call: forward modes take Enzyme's tangent struct directly,
-# and reverse modes seed a scalarised primal whose return is the
-# cotangent-weighted sum of the outputs.
-# ``(leading, selector, directions)``: leading array arguments before the
-# primal's own, whether a row/column selector trails them, and how many further
-# copies of the primal's argument list follow as direction vectors. A direction
-# set mirrors the primal's arguments exactly -- an array where the primal takes
-# a tuple, a scalar where it takes a scalar -- so a seed never has to be
-# materialised in a shape the caller does not already have.
+# scalars. A tuple-returning primal needs no output array, so neither the
+# primal values nor a shadow work buffer cross the call: forward modes take
+# Enzyme's tangent struct directly, and reverse modes seed a scalarised primal
+# whose return is the cotangent-weighted sum of the outputs.
+# ``(leading, directions)``: leading array arguments before the primal's own,
+# and how many further copies of the primal's argument list follow as direction
+# vectors. A direction set mirrors the primal's arguments exactly -- an array
+# where the primal takes a tuple, a scalar where it takes a scalar -- so a seed
+# never has to be materialised in a shape the caller does not already have.
 _TUPLE_CALL_LAYOUT = {
-    "jacfwd": (1, False, 0),  # (jacobian, *args)
-    "jacfwd_column": (1, True, 0),  # (column, *args, index)
-    "jvp": (1, False, 1),  # (tangent, *args, *directions); see _call_arities
-    "vjp": (2, False, 0),  # (cotangent, gradient, *args)
-    "jacrev": (1, False, 0),  # (jacobian, *args)
-    "jacrev_row": (1, True, 0),  # (gradient, *args, row)
+    "jacfwd": (1, 0),  # (jacobian, *args)
+    "jvp": (1, 1),  # (tangent, *args, *directions); see _call_arities
+    "vjp": (2, 0),  # (cotangent, gradient, *args)
+    "jacrev": (1, 0),  # (jacobian, *args)
 }
 
 
@@ -823,17 +817,17 @@ def _call_arities(mode, n_params, depth=1, n_dirs=1):
     """
     arities = {}
     if mode not in TUPLE_ONLY_MODES:
-        scalar = {"jvp": 2, "vjp": 2, "jacrev_row": n_params + 1}
+        scalar = {"jvp": 2, "vjp": 2}
         arities["scalar"] = scalar.get(mode, n_params)
     if mode not in SCALAR_ONLY_MODES:
-        leading, selector, directions = _TUPLE_CALL_LAYOUT[mode]
+        leading, directions = _TUPLE_CALL_LAYOUT[mode]
         # Each composition level differentiates the level below with respect to
         # *all* of its arguments, so it takes a direction per argument and the
         # level's own argument list doubles: 2**(depth - 1) copies of the
         # primal's. A directional endpoint then adds a seed of that same width.
         groups = 2 ** (depth - 1)
         sets = n_dirs if directions else 0
-        arities["tuple"] = leading + n_params * groups * (1 + sets) + int(selector)
+        arities["tuple"] = leading + n_params * groups * (1 + sets)
     return arities
 
 
@@ -926,14 +920,13 @@ def _validate_modes_for_shape(requested, shape):
 
 
 # Stem of the external symbol names each reverse mode's per-partial entry
-# points get, and whether those entry points take a trailing cotangent or
-# output-row selector. A scalar primal's gradient and reverse Jacobian are the
-# same sweep, differing only in the public wrapper built around them.
+# points get, and whether those entry points take a trailing cotangent. A
+# scalar primal's gradient and reverse Jacobian are the same sweep, differing
+# only in the public wrapper built around them.
 _SCALAR_REVERSE_ENTRIES = {
-    "grad": ("grad", None),
-    "vjp": ("vjp", "cotangent"),
-    "jacrev": ("jacrev", None),
-    "jacrev_row": ("jacrevrow", "row"),
+    "grad": ("grad", False),
+    "vjp": ("vjp", True),
+    "jacrev": ("jacrev", False),
 }
 
 
@@ -1014,7 +1007,7 @@ def synthesise_cuda(
             name="__enzyme_autodiff",
         )
 
-    def reverse_components(stem, selector):
+    def reverse_components(stem, weighted):
         """
         Emit the scalar C-ABI entry points composing one reverse-mode tuple.
 
@@ -1027,19 +1020,16 @@ def synthesise_cuda(
         ----------
         stem : str
             Middle portion of the generated external symbol names.
-        selector : str or None
-            Name of a trailing argument scaling the partial derivative: a
-            ``cotangent`` of the primal's scalar type, or an ``i32`` output
-            ``row`` that zeroes every component outside row zero. `None` emits
-            the bare partials.
+        weighted : bool
+            Whether a trailing ``cotangent`` of the primal's scalar type
+            scales the partial derivative. `False` emits the bare partials.
 
         Returns
         -------
         tuple of str
             The generated symbol names, one per primal argument.
         """
-        cotangent = selector == "cotangent"
-        extras = [scalar_type] if cotangent else [ir.IntType(32)] if selector else []
+        extras = [scalar_type] if weighted else []
         generated = tuple(
             f"numba_enzyme_{stem}_{symbol_suffix}_{index}" for index in range(n_args)
         )
@@ -1051,8 +1041,8 @@ def synthesise_cuda(
             )
             for index, arg in enumerate(entry_fn.args[:n_args]):
                 arg.name = f"x{index}"
-            if selector:
-                entry_fn.args[n_args].name = selector
+            if weighted:
+                entry_fn.args[n_args].name = "cotangent"
 
             builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
             gradient = builder.call(
@@ -1061,22 +1051,14 @@ def synthesise_cuda(
             value = (
                 gradient if n_args == 1 else builder.extract_value(gradient, component)
             )
-            if cotangent:
+            if weighted:
                 value = builder.fmul(value, entry_fn.args[n_args])
-            elif selector:
-                value = builder.select(
-                    builder.icmp_signed(
-                        "==", entry_fn.args[n_args], ir.Constant(ir.IntType(32), 0)
-                    ),
-                    value,
-                    ir.Constant(scalar_type, 0.0),
-                )
             builder.ret(value)
         return generated
 
-    for mode, (stem, selector) in _SCALAR_REVERSE_ENTRIES.items():
+    for mode, (stem, weighted) in _SCALAR_REVERSE_ENTRIES.items():
         if mode in requested:
-            symbols[mode] = reverse_components(stem, selector)
+            symbols[mode] = reverse_components(stem, weighted)
 
     if "jvp" in requested:
         # The MLIR wrapper flattens the two public tuples as x0..xn, dx0..dxn.
@@ -1117,7 +1099,7 @@ _MEMREF_FIELDS = {
 }
 
 
-def _declare_entry_point(module, name, params, selector=None):
+def _declare_entry_point(module, name, params):
     """
     Declare one derivative entry point and name and split its arguments.
 
@@ -1135,8 +1117,6 @@ def _declare_entry_point(module, name, params, selector=None):
     params : sequence of tuple
         The entry point's parameters in order, each either
         ``("array", prefix, ndim)`` or ``("scalar", prefix, llvm_type)``.
-    selector : str, optional
-        Name of a trailing ``i32`` row or column selector, when there is one.
 
     Returns
     -------
@@ -1145,8 +1125,6 @@ def _declare_entry_point(module, name, params, selector=None):
     handles : list
         One entry per element of `params`, in order: the tuple of descriptor
         fields for an array, or the value itself for a scalar.
-    index : llvmlite.ir.Value or None
-        The trailing selector, when `selector` was given.
 
     See Also
     --------
@@ -1160,8 +1138,6 @@ def _declare_entry_point(module, name, params, selector=None):
             parameters += [i8p, i8p] + [i64] * (len(_MEMREF_FIELDS[detail]) - 2)
         else:
             parameters.append(detail)
-    if selector is not None:
-        parameters.append(ir.IntType(32))
 
     entry_fn = ir.Function(
         module, ir.FunctionType(ir.VoidType(), parameters), name=name
@@ -1181,11 +1157,7 @@ def _declare_entry_point(module, name, params, selector=None):
             argument.name = prefix
             handles.append(argument)
             position += 1
-    selected = None
-    if selector is not None:
-        selected = entry_fn.args[-1]
-        selected.name = selector
-    return entry_fn, handles, selected
+    return entry_fn, handles
 
 
 def _synthesise_cuda_tuple(
@@ -1499,22 +1471,6 @@ def _synthesise_cuda_tuple(
         # This stage exists only to resolve the inner markers; the endpoint
         # goes in the next one.
         return CUDASynthesisedDriver(ir=str(module), modes=requested, symbols=symbols)
-    if "jacfwd_column" in requested:
-        # (column, <level arguments>, index).
-        symbol = f"numba_enzyme_jacfwdcol_{symbol_suffix}"
-        entry_fn, (column_out, *arguments), selected = _declare_entry_point(
-            module,
-            symbol,
-            [("array", "column", 1), *level_params],
-            selector="column",
-        )
-        builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
-        xs = flatten_groups(builder, arguments)
-        store_vector(
-            builder, forward(builder, level_fn, xs, selected), n_out, column_out
-        )
-        builder.ret_void()
-        symbols["jacfwd_column"] = (symbol,)
 
     if "jvp" in requested:
         # (tangent, <level arguments>, <direction>): one sweep for the whole
@@ -1523,7 +1479,7 @@ def _synthesise_cuda_tuple(
         # that wants J @ v pays one sweep rather than one per column.
         symbol = f"numba_enzyme_jvp_{symbol_suffix}"
         per_sweep = len(level_params) // n_parameters
-        entry_fn, (tangent_out, *arguments), _ = _declare_entry_point(
+        entry_fn, (tangent_out, *arguments) = _declare_entry_point(
             module,
             symbol,
             [
@@ -1562,7 +1518,7 @@ def _synthesise_cuda_tuple(
     if "jacfwd" in requested:
         # (jacobian, <level arguments>): one forward sweep per column.
         symbol = f"numba_enzyme_jacfwd_{symbol_suffix}"
-        entry_fn, (jac, *arguments), _ = _declare_entry_point(
+        entry_fn, (jac, *arguments) = _declare_entry_point(
             module, symbol, [("array", "jac", 2), *level_params]
         )
 
@@ -1577,7 +1533,7 @@ def _synthesise_cuda_tuple(
         # (cotangent, gradient, <level arguments>).
         symbol = f"numba_enzyme_vjp_{symbol_suffix}"
         rank = 2 if n_dirs > 1 else 1
-        entry_fn, (cotangent, gradient, *arguments), _ = _declare_entry_point(
+        entry_fn, (cotangent, gradient, *arguments) = _declare_entry_point(
             module,
             symbol,
             [
@@ -1628,31 +1584,10 @@ def _synthesise_cuda_tuple(
             builder.ret_void()
         symbols["vjp"] = (symbol,)
 
-    if "jacrev_row" in requested:
-        # (gradient, <level arguments>, row).
-        symbol = f"numba_enzyme_jacrevrow_{symbol_suffix}"
-        entry_fn, (gradient, *arguments), selected = _declare_entry_point(
-            module,
-            symbol,
-            [("array", "gradient", 1), *level_params],
-            selector="row",
-        )
-        builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
-        xs = flatten_groups(builder, arguments)
-        weights = unit_weights(builder, builder.sext(selected, i64), n_out)
-        store_vector(
-            builder,
-            reverse(builder, level_fn, level_args, n_out, xs, weights),
-            level_args,
-            gradient,
-        )
-        builder.ret_void()
-        symbols["jacrev_row"] = (symbol,)
-
     if "jacrev" in requested:
         # (jacobian, <level arguments>): one reverse sweep per output row.
         symbol = f"numba_enzyme_jacrev_{symbol_suffix}"
-        entry_fn, (jac, *arguments), _ = _declare_entry_point(
+        entry_fn, (jac, *arguments) = _declare_entry_point(
             module, symbol, [("array", "jac", 2), *level_params]
         )
 
@@ -1810,11 +1745,9 @@ def _device_signatures(arg_types, return_type, shape, depth=1, n_dirs=1) -> dict
         sweeps = matrix if n_dirs > 1 else array
         return {
             "jacfwd": cuda_types.void(matrix, *level),
-            "jacfwd_column": cuda_types.void(array, *level, cuda_types.int32),
             "jvp": cuda_types.void(sweeps, *level, *(level * n_dirs)),
             "vjp": cuda_types.void(sweeps, sweeps, *level),
             "jacrev": cuda_types.void(matrix, *level),
-            "jacrev_row": cuda_types.void(array, *level, cuda_types.int32),
         }
     tuple_type = cuda_types.UniTuple(return_type, len(arg_types))
     return {
@@ -1822,7 +1755,6 @@ def _device_signatures(arg_types, return_type, shape, depth=1, n_dirs=1) -> dict
         "jvp": return_type(tuple_type, tuple_type),
         "vjp": tuple_type(tuple_type, return_type),
         "jacrev": tuple_type(*arg_types),
-        "jacrev_row": tuple_type(*arg_types, cuda_types.int32),
     }
 
 
@@ -2275,7 +2207,6 @@ def load_cuda(built: CUDABuiltKernel) -> CUDADifferentiable:
             forwarded, extras = {
                 "grad": (names[:n_args], ()),
                 "jacrev": (names[:n_args], ()),
-                "jacrev_row": (names[: n_args + 1], (backend["types"].int32,)),
                 "vjp": ([*primal_items, "a1"], (return_type,)),
             }[mode]
             signature = return_type(*arg_types, *extras)
