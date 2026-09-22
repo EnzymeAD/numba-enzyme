@@ -222,7 +222,7 @@ def _cuda_imports():
     except (ImportError, AttributeError) as exc:
         raise CUDAEnzymeError(
             "CUDA differentiation requires numba-cuda-mlir >= 0.5.1; "
-            "install numba-enzyme[cuda]"
+            "install numba-enzyme-cuda[cuda]"
         ) from exc
     return {
         "cuda": cuda,

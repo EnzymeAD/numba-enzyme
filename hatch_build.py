@@ -32,7 +32,7 @@ into `_vendor/lib/` rather than kept at that top-level name because
 layout resolves without shipping a directory that sits outside the
 package.
 
-The wheel is tagged `py3-none-linux_x86_64`. Everything under
+The wheel is tagged `py3-none-manylinux_2_38_x86_64`. Everything under
 `_vendor/` is a standalone executable or shared object rather than a
 CPython extension, and the package has no extension modules at all, so
 nothing here is ABI-specific and a CPython tag would only narrow which
@@ -65,7 +65,11 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 # the last upload must still resolve to a real file on PyPI.
 _VENDOR_WHEEL_VERSION = "0.1.3"
 _PYPI_RELEASE_JSON = "https://pypi.org/pypi/numba-enzyme/{version}/json"
-_WHEEL_TAG = "py3-none-linux_x86_64"
+# manylinux rather than a bare `linux_x86_64`, which PyPI rejects outright.
+# 2.38 is the highest GLIBC_ symbol version any binary under _vendor/
+# references (measured over all 19 ELF files in the built wheel), which is
+# what auditwheel would derive from the contents anyway.
+_WHEEL_TAG = "py3-none-manylinux_2_38_x86_64"
 
 # Everything toolchain.py resolves, and so everything the staged tree
 # has to hold for the wheel to be worth shipping.

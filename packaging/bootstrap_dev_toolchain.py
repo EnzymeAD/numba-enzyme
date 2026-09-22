@@ -16,6 +16,9 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_DESTINATION = _REPO_ROOT / ".dev-toolchain"
 _DEFAULT_WHEEL_VERSION = "0.1.3"
+# Upstream, deliberately: this is where the prebuilt LLVM/Enzyme binaries
+# come from, and this fork (published as numba-enzyme-cuda) has none of
+# its own to download. Same reasoning as hatch_build.py.
 _DISTRIBUTION = "numba-enzyme"
 _TOOLS = ("clang", "llvm-link", "opt", "ld.lld")
 

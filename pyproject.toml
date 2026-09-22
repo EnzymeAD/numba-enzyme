@@ -1,7 +1,13 @@
 [project]
-name = "numba-enzyme"
-version = "0.1.3"
-description = "Differentiate Numba-compiled Python functions with the standalone Enzyme LLVM plugin."
+# The CUDA-enabled fork, published separately because upstream's release has no
+# CUDA backend and PyPI metadata cannot point at a fork's release asset. It
+# still provides the `numba_enzyme` import package, so it is a drop-in
+# replacement and the two distributions must not be installed together. The
+# version is this distribution's own: it carries upstream 0.1.3 plus the CUDA
+# backend and the composable, tuple-shaped `jvp` menodax drove.
+name = "numba-enzyme-cuda"
+version = "0.2.0"
+description = "Differentiate Numba-compiled Python and CUDA device functions with the standalone Enzyme LLVM plugin."
 readme = "README.md"
 license = "Apache-2.0 WITH LLVM-exception"
 authors = [
@@ -36,7 +42,8 @@ cuda = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Qruise-ai/numba-enzyme"
+Repository = "https://github.com/lawrenceberry/numba-enzyme"
+Upstream = "https://github.com/Qruise-ai/numba-enzyme"
 
 [build-system]
 requires = ["hatchling"]

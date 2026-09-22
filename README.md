@@ -1,11 +1,16 @@
-# numba-enzyme
+# numba-enzyme-cuda
 
 Differentiate [Numba](https://numba.pydata.org/)-compiled Python functions via [Enzyme](https://enzyme.mit.edu/).
+
+This is the CUDA-enabled fork of [numba-enzyme](https://github.com/Qruise-ai/numba-enzyme),
+published under its own name because the upstream release carries no CUDA
+backend. It provides the same `numba_enzyme` import package, so it is a drop-in
+replacement -- and the two must not be installed side by side.
 
 ## Install
 
 ```bash
-pip install numba-enzyme
+pip install numba-enzyme-cuda
 ```
 
 ### Supported platforms
@@ -90,7 +95,7 @@ use reverse mode, while `jacfwd` uses one forward sweep per input.
 Install the optional Numba-CUDA-MLIR integration and a CUDA toolkit:
 
 ```bash
-pip install 'numba-enzyme[cuda]'
+pip install 'numba-enzyme-cuda[cuda]'
 ```
 
 An `@cuda.jit(device=True)` function can be differentiated on the host without
