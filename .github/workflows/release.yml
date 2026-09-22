@@ -1,0 +1,63 @@
+name: Release to PyPI
+
+# Tags own the release. `wheels.yml` builds the toolchain from source in the
+# manylinux image and is kept for verifying that path and for TestPyPI, but it
+# no longer publishes on a tag: two workflows uploading the same version would
+# race, and the second would fail on a file PyPI already has.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # No cibuildwheel and no Docker: hatch_build.py stages the LLVM 15 +
+      # Enzyme binaries out of upstream's released manylinux wheel, which is
+      # where they come from either way, and the result is the same
+      # self-contained ~71 MB wheel -- under PyPI's 100 MB per-file limit.
+      - name: Build the sdist and wheel
+        run: uv build
+
+      - name: Check the metadata PyPI will read
+        run: uvx twine check --strict dist/*
+
+      # The wheel is only worth anything if the toolchain inside it survived
+      # the build with its permissions intact, and nothing else here would
+      # notice if it had not.
+      - name: Check the vendored toolchain runs
+        run: |
+          python -m zipfile -e dist/*.whl unpacked/
+          chmod +x unpacked/numba_enzyme/_vendor/bin/*
+          unpacked/numba_enzyme/_vendor/bin/clang --version
+          unpacked/numba_enzyme/_vendor/bin/opt --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted publishing: PyPI mints a short-lived token from this workflow's
+    # OIDC identity, so no API token lives in the repository. A publisher for
+    # numba-enzyme-cuda naming this workflow file and environment has to exist
+    # on the PyPI side first.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/numba-enzyme-cuda
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
