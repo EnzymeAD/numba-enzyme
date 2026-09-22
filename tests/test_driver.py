@@ -7,11 +7,14 @@ functions and arities, both AD modes.
 
 import math
 
+import numpy as np
 import pytest
 
 from numba_enzyme.build import build
+from numba_enzyme.driver import synthesise
+from numba_enzyme.lowering import lower
 from numba_enzyme.runtime import load
-from numba_enzyme.types import Float64
+from numba_enzyme.types import Array1D, Float64
 
 
 def f1(x: Float64) -> Float64:
@@ -67,3 +70,52 @@ def test_jvp_matches_analytic(func, analytic_grad):
         seed = tuple(1.0 if k == i else 0.0 for k in range(n))
         got = diff.jvp(xs, seed)
         assert got == pytest.approx(expected[i], abs=1e-9)
+
+
+def farr(x: Array1D(Float64)) -> Float64:
+    s = 0.0
+    for i in range(x.shape[0]):
+        s += x[i] * x[i]
+    return s
+
+
+def farr_grad(x):
+    return 2 * x
+
+
+def test_synthesise_array_grad_signature():
+    """
+    IR-shape check, before ever running Enzyme: a single array argument
+    (no scalar args) means grad_<entry> has no packed `out` pointer at
+    all -- there is nothing for __enzyme_autodiff to pack/return, since
+    the array's gradient is instead accumulated in place into its own
+    dedicated shadow-pointer parameter (x0_ddata).
+    """
+    drv = synthesise(lower(farr))
+    signature = (
+        f'define void @"{drv.grad_symbol}"(double* %"x0_data", '
+        'double* %"x0_ddata", i64 %"x0_nitems", i64 %"x0_itemsize", '
+        'i64 %"x0_shape0", i64 %"x0_strides0")'
+    )
+    assert signature in drv.ir
+    grad_start = drv.ir.index(signature)
+    grad_body = drv.ir[grad_start : drv.ir.index("\n}\n", grad_start)]
+    assert 'call void (i8*, ...) @"__enzyme_autodiff"' in grad_body
+    # 2 enzyme_dup markers (retptr's cotangent seed, and the array's
+    # data/d_data pair) + 7 enzyme_const markers (excinfo, meminfo,
+    # parent, nitems, itemsize, shape, strides).
+    assert grad_body.count('@"enzyme_dup"') == 2
+    assert grad_body.count('@"enzyme_const"') == 7
+
+
+def test_grad_and_jvp_match_analytic_for_array_argument():
+    diff = load(build(farr))
+    x = np.array([1.0, 2.0, 3.0])
+    (g,) = diff.grad(x)
+    assert g == pytest.approx(farr_grad(x), abs=1e-9)
+
+    for i in range(len(x)):
+        seed = np.zeros_like(x)
+        seed[i] = 1.0
+        got = diff.jvp((x,), (seed,))
+        assert got == pytest.approx(farr_grad(x)[i], abs=1e-9)

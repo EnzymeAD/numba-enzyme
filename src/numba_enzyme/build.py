@@ -1,10 +1,9 @@
 """
-Orchestrate and cache the full lowering-to-shared-object pipeline.
+Handles the pipeline from lowering the function to building the shared object.
 
-Wires lowering, driver synthesis, ``llvm-link``, the Enzyme ``opt``
-pass, and the final shared-object compile into a single call, and
-caches built ``.so`` files on disk, keyed on the function's source text
-and a fingerprint of the toolchain used to build it.
+Wires lowering, driver synthesis, `llvm-link`, the Enzyme `opt`
+pass, and the final shared object compilation into a single call, and
+caches the built `.so` files on disk.
 
 See Also
 --------
@@ -32,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from numba_enzyme.driver import synthesise
-from numba_enzyme.lowering import lower
+from numba_enzyme.lowering import ArgSpec, lower
 from numba_enzyme.toolchain import get_toolchain
 
 _CACHE_DIR_ENV_VAR = "NUMBA_ENZYME_CACHE_DIR"
@@ -47,7 +46,7 @@ class BuiltKernel:
     Attributes
     ----------
     path : pathlib.Path
-        Path to the built ``.so`` file.
+        Path to the built `.so` file.
     grad_symbol : str
         Name of the reverse-mode entry point exported by `path`.
     jvp_symbol : str
@@ -55,8 +54,7 @@ class BuiltKernel:
     n_args : int
         Number of scalar arguments the original function takes.
     from_cache : bool
-        Whether this result was served from the on-disk cache rather
-        than freshly compiled.
+        Whether the shared object was loaded from the disk.
 
     See Also
     --------
@@ -76,15 +74,16 @@ class BuiltKernel:
     grad_symbol: str
     jvp_symbol: str
     n_args: int
+    arg_specs: tuple[ArgSpec, ...]
     from_cache: bool
 
 
 def _cache_dir() -> Path:
     """
-    Return the directory `build` caches compiled shared objects in.
+    Path in which the cached shared-objects are stored.
 
-    Defaults to ``~/.cache/numba_enzyme``, overridable via the
-    ``NUMBA_ENZYME_CACHE_DIR`` environment variable.
+    Defaults to `~/.cache/numba_enzyme`, overridable via the
+    `NUMBA_ENZYME_CACHE_DIR` environment variable.
 
     Returns
     -------
@@ -105,9 +104,8 @@ def _toolchain_fingerprint() -> str:
     """
     Fingerprint the resolved toolchain by each tool's mtime and size.
 
-    Used as part of the cache key so rebuilding any tool -- most
-    notably the Enzyme plugin itself -- invalidates every cache entry
-    automatically.
+    Used as part of the cache key. Rebuilding any part of the toolchain
+    invalidates every cache entry.
 
     Returns
     -------
@@ -211,8 +209,8 @@ def build(func: Callable) -> BuiltKernel:
     Build, or fetch from cache, the shared object for a function.
 
     Lowers `func` with Numba, synthesises its Enzyme driver, links the
-    two with ``llvm-link``, runs the standalone Enzyme ``opt`` pass, and
-    compiles the result to a shared object with ``clang``. If an
+    two with `llvm-link`, runs the standalone Enzyme `opt` pass, and
+    compiles the result to a shared object with `clang`. If an
     identical build (same source text and toolchain fingerprint) is
     already cached on disk, the cached one is returned without any
     subprocess calls.
@@ -248,7 +246,7 @@ def build(func: Callable) -> BuiltKernel:
     meta_path = entry_dir / "meta.json"
 
     if so_path.is_file() and meta_path.is_file():
-        # if the statement is true, lower() isn't call again here. The
+        # if the statement is true, lower() isn't called again here. The
         # reason is that Numba embeds an internal version counter in the
         # mangled symbol name that increments every time nb.cfunc compiles
         # the same function again in the same process (e.g. ...B2v1...
@@ -256,8 +254,22 @@ def build(func: Callable) -> BuiltKernel:
         # names on a cache hit would silently drift from what's actually
         # embedded into the already-built .so. Persist them from the
         # original build instead.
-        meta = json.loads(meta_path.read_text())
-        return BuiltKernel(path=so_path, from_cache=True, **meta)
+        raw_meta = json.loads(meta_path.read_text())
+        try:
+            meta = {
+                "grad_symbol": raw_meta["grad_symbol"],
+                "jvp_symbol": raw_meta["jvp_symbol"],
+                "n_args": raw_meta["n_args"],
+                "arg_specs": tuple(ArgSpec(**spec) for spec in raw_meta["arg_specs"]),
+            }
+        except (KeyError, TypeError):
+            # meta.json doesn't match the schema this version of build()
+            # expects, in this case it rebuilds the meta.json. Any shape
+            # mismatc will fall under this branch as a missing/unexpected
+            # key and is treated the same way.
+            pass
+        else:
+            return BuiltKernel(path=so_path, from_cache=True, **meta)
 
     kernel = lower(func)
     drv = synthesise(kernel)
@@ -352,7 +364,8 @@ def build(func: Callable) -> BuiltKernel:
         "grad_symbol": drv.grad_symbol,
         "jvp_symbol": drv.jvp_symbol,
         "n_args": kernel.n_args,
+        "arg_specs": kernel.arg_specs,
     }
-    meta_path.write_text(json.dumps(meta))
+    meta_path.write_text(json.dumps(meta, default=vars))
 
     return BuiltKernel(path=so_path, from_cache=False, **meta)

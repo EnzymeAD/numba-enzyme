@@ -21,6 +21,7 @@ Examples
 """
 
 import inspect
+import re
 import typing
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -30,20 +31,30 @@ import numba as nb
 
 _CFUNC_PREFIX = "cfunc."
 
-# Numba's fixed internal exception-info representation. Stable across
-# signatures/arities in principle, but re-checked on every lowering
-# for the sake of sanity.
+# Numba's execption data representation.
 _EXPECTED_EXCINFO_TYPE = "{ i8*, i32, i8*, i8*, i32 }**"
 
-# LLVM textual type for each scalar numba type this package accepts as
-# an annotation (see numba_enzyme.types).
-# TODO: expand for other scalar types and arrays
+# LLVM textual (bare) type for each numba scalar type.
+# TODO: expand for other scalar types
 _LLVM_SCALAR_TYPE = {
     nb.types.float64: "double",
     nb.types.float32: "float",
     nb.types.int32: "i32",
     nb.types.int64: "i64",
 }
+
+# Flattened array ABI of a Numba array on the LLVM IR level.
+# struct fields in order: meminfo (i8*), parent (i8*), nitems (i64),
+# itemsize (i64), data (<elem>*), shape[0..ndim-1] (i64 each),
+# strides[0..ndim-1] (i64 each).
+_ARRAY_HEADER_TYPES = ("i8*", "i8*", "i64", "i64")  # is this universal for every arch?
+
+# Matches a call to any Numba NRT (memory-management runtime) function,
+# e.g. NRT_incref, NRT_MemInfo_alloc. At the moment `driver.py` passes
+# `meminfo=NULL` for array arguments. I want to reject any kernel body
+# that calls NRT.
+# TODO: handle NRT calls.
+_NRT_CALL_RE = re.compile(r"\bcall\b[^\n]*@(NRT_\w+)")
 
 llvm_binding.initialize()
 
@@ -73,6 +84,63 @@ class LoweringError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ArgSpec:
+    """
+    Describes the ABI of one flattened logical argument.
+
+    A logical argument is a single LLVM parameter associated with
+    a scalar argument or an amalgamation of flattened LLVM parameters
+    for an arrays. A scalar argument is identified by one LLVM parameter
+    and an array in numba is represented by 5 + 2*ndim flattened LLVM
+    parameters. For arrays we have `meminfo`, `parent`, `ntimes`,
+    `itemsize`, `data` (5 in total) plus `shape` and `stride` for each
+    `ndim` (hence 2 * ndim).
+
+    Attributes
+    ----------
+    kind : str
+        `scalar` or `array`, specifies the kind of the argument.
+    llvm_type : str | None
+        The LLVM type, e.g. `"double"`. This attribute gets assigned
+        when `kind="scalar"` only, otherwise it is set to `None`.
+    ndim : int | None
+        The array's rank. This attribute gets assigned when `kind="array"`
+        only, otherwise it is set to `None`.
+    elem_llvm_type : str | None
+        The LLVM type of the array's elements, e.g. `"double"`. This
+        attribute gets assigned when `kind="array"` only, otherwise
+        it is set to `None`.
+
+    See Also
+    --------
+    LoweredKernel : Carries one `ArgSpec` per logical argument.
+
+    Examples
+    --------
+    >>> from numba_enzyme.lowering import ArgSpec
+    >>> ArgSpec(kind="array", ndim=1, elem_llvm_type="double").n_fields
+    7
+    """
+
+    kind: str
+    llvm_type: str | None = None
+    ndim: int | None = None
+    elem_llvm_type: str | None = None
+
+    @property
+    def n_fields(self) -> int:
+        """
+        Number of flattened LLVM parameters a given argument occupies.
+
+        Returns
+        -------
+        int
+            `1` for a scalar, `5 + 2*ndim` for an array.
+        """
+        return 1 if self.kind == "scalar" else 5 + 2 * self.ndim
+
+
+@dataclass(frozen=True)
 class LoweredKernel:
     """
     A Numba-compiled kernel, validated against the expected ABI.
@@ -84,11 +152,17 @@ class LoweredKernel:
     entry_symbol : str
         The mangled name of the retptr/excinfo-ABI entry point.
     n_args : int
-        Number of scalar arguments `entry_symbol` takes.
-    arg_types : tuple of str
-        The entry point's real LLVM parameter types in order: the
-        output pointer, the exception-info pointer, then `n_args`
-        scalar types.
+        Number of logical arguments `entry_symbol` takes. Not to be
+        confused with the number of flattened LLVM parameters, which
+        may be larger once array arguments are involved.
+    arg_types : tuple[str, ...]
+        The entry point's flattened LLVM parameter types in the
+        following order: the output pointer, the exception-info pointer,
+        then one entry per flattened parameter (one per scalar argument,
+        or `5 + 2*ndim` per array argument).
+    arg_specs : tuple[ArgSpec, ...]
+        One `ArgSpec` per logical argument, in declaration order,
+        describing how each argument's fields map into `arg_types`.
 
     See Also
     --------
@@ -108,6 +182,7 @@ class LoweredKernel:
     entry_symbol: str
     n_args: int
     arg_types: tuple[str, ...]
+    arg_specs: tuple[ArgSpec, ...]
 
 
 def _numba_type_of(annotation) -> nb.types.Type:
@@ -122,7 +197,7 @@ def _numba_type_of(annotation) -> nb.types.Type:
     Returns
     -------
     numba.core.types.Type
-        The real numba type the annotation class's ``__new__`` returns.
+        The numba type the annotation returns.
 
     Raises
     ------
@@ -156,7 +231,7 @@ def _llvm_scalar_type(numba_type: nb.types.Type) -> str:
     Returns
     -------
     str
-        The corresponding LLVM IR textual type, e.g. ``"double"``.
+        The corresponding LLVM IR textual type, e.g. `"double"`.
 
     Raises
     ------
@@ -183,17 +258,14 @@ def lower(func: Callable) -> LoweredKernel:
     """
     Compile a Python function to a validated `LoweredKernel`.
 
-    Reads `func`'s parameter and return type annotations (each must be
-    a `numba_enzyme.types` class) to build the Numba signature, compiles
-    it with :func:`numba.cfunc`, then locates and validates the
-    resulting retptr/excinfo entry point.
+    Reads `func`'s parameter and return type annotations to build
+    the Numba signature, compiles it with :func:`numba.cfunc`, then
+    locates and validates the resulting retptr/excinfo entry point.
 
     Parameters
     ----------
     func : callable
-        A Python function whose parameters and return value are each
-        annotated with a `numba_enzyme.types` class, e.g.
-        ``def f(x: Float64) -> Float64: ...``.
+        An annotated Python function whose.
 
     Returns
     -------
@@ -251,14 +323,18 @@ def lower(func: Callable) -> LoweredKernel:
 
     args = list(fn.arguments)
     n_args = len(arg_numba_types)
-    expected_n_params = n_args + 2
+    expected_n_flat_params = sum(
+        5 + 2 * t.ndim if isinstance(t, nb.types.Array) else 1 for t in arg_numba_types
+    )
+    expected_n_params = expected_n_flat_params + 2
     if len(args) != expected_n_params:
         raise LoweringError(
             f"expected {expected_n_params} parameters (retptr, excinfo, "
-            f"{n_args} scalar args) but {entry_symbol!r} has {len(args)}"
+            f"{expected_n_flat_params} flattened args) but {entry_symbol!r} "
+            f"has {len(args)}"
         )
 
-    retptr, excinfo, *scalar_args = args
+    retptr, excinfo, *flat_args = args
 
     expected_retptr_type = _llvm_scalar_type(ret_numba_type) + "*"
     if retptr.name != "retptr" or str(retptr.type) != expected_retptr_type:
@@ -271,14 +347,52 @@ def lower(func: Callable) -> LoweredKernel:
             f"expected second parameter 'excinfo: {_EXPECTED_EXCINFO_TYPE}', "
             f"got {excinfo.name!r}: {excinfo.type}"
         )
-    for arg, numba_type in zip(scalar_args, arg_numba_types):
-        expected = _llvm_scalar_type(numba_type)
-        if str(arg.type) != expected:
-            raise LoweringError(
-                f"expected parameter {arg.name!r} to be {expected}, got {arg.type}"
+
+    arg_specs = []
+    flat_idx = 0
+    for numba_type in arg_numba_types:
+        if isinstance(numba_type, nb.types.Array):
+            ndim = numba_type.ndim
+            elem_llvm_type = _llvm_scalar_type(numba_type.dtype)
+            expected_fields = (
+                *_ARRAY_HEADER_TYPES,
+                elem_llvm_type + "*",
+                *("i64",) * ndim,  # this is valid only for 64bit?
+                *("i64",) * ndim,  # this is valid only for 64bit?
             )
+            for expected in expected_fields:
+                arg = flat_args[flat_idx]
+                if str(arg.type) != expected:
+                    raise LoweringError(
+                        f"expected parameter {arg.name!r} to be {expected}, "
+                        f"got {arg.type}"
+                    )
+                flat_idx += 1
+            arg_specs.append(
+                ArgSpec(kind="array", ndim=ndim, elem_llvm_type=elem_llvm_type)
+            )
+        else:
+            expected = _llvm_scalar_type(numba_type)
+            arg = flat_args[flat_idx]
+            if str(arg.type) != expected:
+                raise LoweringError(
+                    f"expected parameter {arg.name!r} to be {expected}, got {arg.type}"
+                )
+            flat_idx += 1
+            arg_specs.append(ArgSpec(kind="scalar", llvm_type=expected))
+
+    nrt_call = _NRT_CALL_RE.search(ir_text)
+    if nrt_call is not None:
+        raise LoweringError(
+            f"unsupported kernel body: calls {nrt_call.group(1)!r}. Numba "
+            "run-time memory management is not supported at the moment."
+        )
 
     arg_types = tuple(str(a.type) for a in args)
     return LoweredKernel(
-        ir=ir_text, entry_symbol=entry_symbol, n_args=n_args, arg_types=arg_types
+        ir=ir_text,
+        entry_symbol=entry_symbol,
+        n_args=n_args,
+        arg_types=arg_types,
+        arg_specs=tuple(arg_specs),
     )
