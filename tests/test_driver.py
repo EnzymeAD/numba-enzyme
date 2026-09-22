@@ -11,7 +11,7 @@ import pytest
 
 from numba_enzyme.build import build
 from numba_enzyme.runtime import load
-from numba_enzyme.types import Float64
+from numba_enzyme.types import Float32, Float64
 
 
 def f1(x: Float64) -> Float64:
@@ -36,6 +36,14 @@ def f3(x: Float64, y: Float64, z: Float64) -> Float64:
 
 def f3_grad(x, y, z):
     return (y, x + z, y + math.exp(z))
+
+
+def f_vector(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x * x + y
+
+
+def f_vector32(x: Float32, y: Float32) -> tuple[Float32, Float32]:
+    return x * y, x + y
 
 
 @pytest.fixture(autouse=True)
@@ -67,3 +75,42 @@ def test_jvp_matches_analytic(func, analytic_grad):
         seed = tuple(1.0 if k == i else 0.0 for k in range(n))
         got = diff.jvp(xs, seed)
         assert got == pytest.approx(expected[i], abs=1e-9)
+
+
+def test_vector_output_forward_derivatives():
+    diff = load(build(f_vector))
+    x, y = 1.3, 0.7
+
+    assert diff.n_outputs == 2
+    assert diff.jvp((x, y), (0.25, -0.5)) == pytest.approx(
+        (y * 0.25 + x * -0.5, 2 * x * 0.25 - 0.5), abs=1e-9
+    )
+    jacobian = diff.jacfwd(x, y)
+    assert jacobian[0] == pytest.approx((y, x), abs=1e-9)
+    assert jacobian[1] == pytest.approx((2 * x, 1.0), abs=1e-9)
+    assert diff.jvp((x, y), (1.0, 0.0)) == pytest.approx((y, 2 * x), abs=1e-9)
+    assert diff.jvp((x, y), (0.0, 1.0)) == pytest.approx((x, 1.0), abs=1e-9)
+
+
+def test_vector_output_reverse_derivatives():
+    diff = load(build(f_vector))
+    x, y = 1.3, 0.7
+
+    assert diff.vjp((x, y), (0.25, -0.5)) == pytest.approx(
+        (y * 0.25 - x, x * 0.25 - 0.5), abs=1e-9
+    )
+    jacobian = diff.jacrev(x, y)
+    assert jacobian[0] == pytest.approx((y, x), abs=1e-9)
+    assert jacobian[1] == pytest.approx((2 * x, 1.0), abs=1e-9)
+    assert diff.vjp((x, y), (1.0, 0.0)) == pytest.approx((y, x), abs=1e-9)
+    assert diff.vjp((x, y), (0.0, 1.0)) == pytest.approx((2 * x, 1.0), abs=1e-9)
+
+
+def test_float32_vector_output_uses_float32_runtime_abi():
+    diff = load(build(f_vector32))
+    jacobian = diff.jacfwd(1.25, 0.75)
+    assert jacobian[0] == pytest.approx((0.75, 1.25), abs=1e-6)
+    assert jacobian[1] == pytest.approx((1.0, 1.0), abs=1e-6)
+    reverse = diff.jacrev(1.25, 0.75)
+    assert reverse[0] == pytest.approx((0.75, 1.25), abs=1e-6)
+    assert reverse[1] == pytest.approx((1.0, 1.0), abs=1e-6)

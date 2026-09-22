@@ -1,10 +1,9 @@
 name: Build and publish wheels
 
+# Not on tags: release.yml owns those, and two workflows uploading one version
+# would race. This one stays for building the toolchain from source in the
+# manylinux image, and for TestPyPI.
 on:
-  push:
-    tags: ["v*"]
-  release:
-    types: [published]
   workflow_dispatch:
 
 jobs:
@@ -75,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/numba-enzyme
+      url: https://test.pypi.org/p/numba-enzyme-cuda
     permissions:
       id-token: write
     steps:
@@ -89,14 +88,15 @@ jobs:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: wheelhouse
 
+  # Kept for a from-source release done by hand; the tag path is release.yml.
   publish-pypi:
     name: Publish to PyPI
     needs: build-wheels
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+    if: false
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/numba-enzyme
+      url: https://pypi.org/p/numba-enzyme-cuda
     permissions:
       id-token: write
     steps:

@@ -21,8 +21,8 @@ Examples
 >>> from numba_enzyme.types import Float64
 >>> def f(x: Float64) -> Float64:
 ...     return x * x
->>> synthesise(lower(f)).grad_symbol  # doctest: +SKIP
-'grad__ZN...'
+>>> synthesise(lower(f)).vjp_symbol  # doctest: +SKIP
+'vjp__ZN...'
 """
 
 from dataclasses import dataclass
@@ -40,6 +40,9 @@ _EXCINFO_STRUCT = ir.LiteralStructType(
         ir.IntType(32),
     ]
 )
+_EXCINFO_PTR_TYPE = _EXCINFO_STRUCT.as_pointer()
+_I8P = ir.IntType(8).as_pointer()
+_I32 = ir.IntType(32)
 
 # TODO: expand for other scalar types
 _SCALAR_IR_TYPE = {
@@ -60,10 +63,12 @@ class SynthesisedDriver:
     ir : str
         The driver module's full LLVM IR text, ready to be linked
         against the kernel's own IR.
-    grad_symbol : str
-        Name of the reverse-mode entry point, ``grad_<entry_symbol>``.
     jvp_symbol : str
         Name of the forward-mode entry point, ``jvp_<entry_symbol>``.
+    vjp_symbol : str
+        Name of the reverse-mode vector-Jacobian product entry point,
+        ``vjp_<entry_symbol>``. A gradient is this product seeded with one,
+        so reverse mode needs no second entry point of its own.
 
     See Also
     --------
@@ -81,8 +86,48 @@ class SynthesisedDriver:
     """
 
     ir: str
-    grad_symbol: str
     jvp_symbol: str
+    vjp_symbol: str
+
+
+@dataclass(frozen=True)
+class _Primal:
+    """
+    The declarations every entry point in one driver module shares.
+
+    Attributes
+    ----------
+    kernel : numba_enzyme.lowering.LoweredKernel
+        The lowered primal being differentiated.
+    module : llvmlite.ir.Module
+        Module the entry points are emitted into.
+    function : llvmlite.ir.Function
+        Declaration of the Numba primal, with its exact discovered type.
+    dup : llvmlite.ir.GlobalVariable
+        Enzyme's duplicated-activity marker.
+    const : llvmlite.ir.GlobalVariable
+        Enzyme's constant-activity marker.
+    arg_types : tuple of llvmlite.ir.Type
+        LLVM type of each scalar primal argument.
+    scalar_type : llvmlite.ir.Type
+        LLVM type of one result component.
+    storage_type : llvmlite.ir.Type
+        LLVM type holding a whole result: the component type itself for a
+        scalar primal, an array of it for a tuple-valued one.
+
+    See Also
+    --------
+    synthesise : Builds the `_Primal` the entry points are emitted against.
+    """
+
+    kernel: LoweredKernel
+    module: ir.Module
+    function: ir.Function
+    dup: ir.GlobalVariable
+    const: ir.GlobalVariable
+    arg_types: tuple
+    scalar_type: ir.Type
+    storage_type: ir.Type
 
 
 def _target_lines(kernel_ir: str) -> tuple[str, str]:
@@ -122,6 +167,219 @@ def _target_lines(kernel_ir: str) -> tuple[str, str]:
     return triple, datalayout
 
 
+def _components(primal: _Primal, builder, pointer, flat: bool):
+    """
+    Yield a pointer to each component of one result value.
+
+    Parameters
+    ----------
+    primal : _Primal
+        Shared declarations of the driver module being built.
+    builder : llvmlite.ir.IRBuilder
+        Builder positioned in the emitting entry point's block.
+    pointer : llvmlite.ir.Value
+        Pointer to the result value.
+    flat : bool
+        Whether `pointer` addresses a caller-supplied buffer of components
+        rather than an aggregate holding all of them.
+
+    Yields
+    ------
+    llvmlite.ir.Value
+        Pointer to one component, in order.
+
+    See Also
+    --------
+    _sweep_prefix : Allocates the aggregates this addresses.
+    """
+    if primal.kernel.n_outputs == 1:
+        yield pointer
+        return
+    for index in range(primal.kernel.n_outputs):
+        leading = [] if flat else [ir.Constant(_I32, 0)]
+        yield builder.gep(pointer, [*leading, ir.Constant(_I32, index)], inbounds=True)
+
+
+def _sweep_prefix(primal: _Primal, builder, cotangent=None):
+    """
+    Allocate one sweep's result shadow and build its marker-call prefix.
+
+    Numba's entry point writes through a return pointer and an
+    exception-info pointer, so both are local to the entry point and only
+    the return value's shadow is ever active.
+
+    Parameters
+    ----------
+    primal : _Primal
+        Shared declarations of the driver module being built.
+    builder : llvmlite.ir.IRBuilder
+        Builder positioned in the emitting entry point's block.
+    cotangent : llvmlite.ir.Value, optional
+        Pointer to the caller's output cotangent, copied into the shadow for
+        a reverse sweep. Forward sweeps leave the shadow zeroed.
+
+    Returns
+    -------
+    prefix : list of llvmlite.ir.Value
+        The leading marker-call arguments both modes share.
+    shadow : llvmlite.ir.Value
+        Pointer to the result's shadow, holding the output tangent once a
+        forward sweep has run.
+
+    See Also
+    --------
+    _components : Addresses the shadow's individual components.
+    """
+    result = builder.alloca(primal.storage_type, name="result")
+    builder.store(ir.Constant(primal.storage_type, None), result)
+    shadow = builder.alloca(primal.storage_type, name="d_result")
+    builder.store(ir.Constant(primal.storage_type, None), shadow)
+    if cotangent is not None:
+        for source, destination in zip(
+            _components(primal, builder, cotangent, flat=True),
+            _components(primal, builder, shadow, flat=False),
+        ):
+            builder.store(builder.load(source), destination)
+    excinfo = builder.alloca(_EXCINFO_PTR_TYPE, name="excinfo")
+    builder.store(ir.Constant(_EXCINFO_PTR_TYPE, None), excinfo)
+    prefix = [
+        builder.bitcast(primal.function, _I8P),
+        builder.load(primal.dup),
+        result,
+        shadow,
+        builder.load(primal.const),
+        excinfo,
+    ]
+    return prefix, shadow
+
+
+def _synthesise_vjp(primal: _Primal, autodiff_fn) -> str:
+    """
+    Add the cotangent-seeded reverse-mode entry point to a driver module.
+
+    The entry point is ``void vjp_<entry>(dx0_out, ..., cotangent, x0, ...)``
+    for every arity and result shape. A gradient is the same sweep seeded
+    with one, so it needs no separate entry point.
+
+    Parameters
+    ----------
+    primal : _Primal
+        Shared declarations of the driver module being built.
+    autodiff_fn : llvmlite.ir.Function
+        Declaration of Enzyme's reverse-mode marker.
+
+    Returns
+    -------
+    str
+        Name of the generated VJP symbol.
+
+    See Also
+    --------
+    _synthesise_jvp : The forward-mode counterpart.
+    """
+    n_args = len(primal.arg_types)
+    symbol = f"vjp_{primal.kernel.entry_symbol}"
+    entry_fn = ir.Function(
+        primal.module,
+        ir.FunctionType(
+            ir.VoidType(),
+            [
+                *(arg_type.as_pointer() for arg_type in primal.arg_types),
+                primal.scalar_type.as_pointer(),
+                *primal.arg_types,
+            ],
+        ),
+        name=symbol,
+    )
+    for index in range(n_args):
+        entry_fn.args[index].name = f"dx{index}_out"
+    entry_fn.args[n_args].name = "cotangent"
+    xs = entry_fn.args[n_args + 1 :]
+    for index, arg in enumerate(xs):
+        arg.name = f"x{index}"
+
+    builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
+    prefix, _ = _sweep_prefix(primal, builder, cotangent=entry_fn.args[n_args])
+    gradient = builder.call(autodiff_fn, [*prefix, *xs])
+    for index, destination in enumerate(entry_fn.args[:n_args]):
+        component = gradient if n_args == 1 else builder.extract_value(gradient, index)
+        builder.store(component, destination)
+    builder.ret_void()
+    return symbol
+
+
+def _synthesise_jvp(primal: _Primal) -> str:
+    """
+    Add the forward-mode entry point to a driver module.
+
+    Every active argument is a ``(primal, tangent)`` duplicated pair and the
+    product always lands in the result's shadow. A scalar primal returns it
+    directly; a tuple-valued one writes its components through a leading
+    ``out`` pointer, since the shadow is an aggregate that would otherwise
+    have to cross the external ABI boundary.
+
+    Parameters
+    ----------
+    primal : _Primal
+        Shared declarations of the driver module being built.
+
+    Returns
+    -------
+    str
+        Name of the generated JVP symbol.
+
+    See Also
+    --------
+    _synthesise_vjp : The reverse-mode counterpart.
+    """
+    n_args = len(primal.arg_types)
+    vector = primal.kernel.n_outputs > 1
+    fwddiff_fn = ir.Function(
+        primal.module,
+        ir.FunctionType(primal.scalar_type, [_I8P], var_arg=True),
+        name="__enzyme_fwddiff",
+    )
+    symbol = f"jvp_{primal.kernel.entry_symbol}"
+    pairs = [item for arg_type in primal.arg_types for item in (arg_type, arg_type)]
+    entry_fn = ir.Function(
+        primal.module,
+        ir.FunctionType(
+            ir.VoidType() if vector else primal.scalar_type,
+            ([primal.scalar_type.as_pointer()] if vector else []) + pairs,
+        ),
+        name=symbol,
+    )
+    offset = 1 if vector else 0
+    if vector:
+        entry_fn.args[0].name = "out"
+    for index in range(n_args):
+        entry_fn.args[offset + 2 * index].name = f"x{index}"
+        entry_fn.args[offset + 2 * index + 1].name = f"dx{index}"
+
+    builder = ir.IRBuilder(entry_fn.append_basic_block("entry"))
+    call_args, shadow = _sweep_prefix(primal, builder)
+    for index in range(n_args):
+        call_args.extend(
+            [
+                builder.load(primal.dup),
+                entry_fn.args[offset + 2 * index],
+                entry_fn.args[offset + 2 * index + 1],
+            ]
+        )
+    builder.call(fwddiff_fn, call_args)
+
+    if not vector:
+        builder.ret(builder.load(shadow))
+        return symbol
+    for source, destination in zip(
+        _components(primal, builder, shadow, flat=False),
+        _components(primal, builder, entry_fn.args[0], flat=True),
+    ):
+        builder.store(builder.load(source), destination)
+    builder.ret_void()
+    return symbol
+
+
 def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     """
     Build the Enzyme driver module for a lowered kernel.
@@ -134,8 +392,8 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     Returns
     -------
     SynthesisedDriver
-        The driver module defining ``grad_<entry>`` (reverse-mode) and
-        ``jvp_<entry>`` (forward-mode) for `kernel`.
+        The driver module defining ``jvp_<entry>`` (forward mode) and
+        ``vjp_<entry>`` (reverse mode) for `kernel`.
 
     See Also
     --------
@@ -150,142 +408,64 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     >>> from numba_enzyme.types import Float64
     >>> def f(x: Float64) -> Float64:
     ...     return x * x
-    >>> synthesise(lower(f)).grad_symbol  # doctest: +SKIP
-    'grad__ZN...'
+    >>> synthesise(lower(f)).vjp_symbol  # doctest: +SKIP
+    'vjp__ZN...'
     """
-    retptr_str, _, *scalar_strs = kernel.arg_types
-    ret_scalar_type = _SCALAR_IR_TYPE[retptr_str[:-1]]
-    arg_scalar_types = [_SCALAR_IR_TYPE[s] for s in scalar_strs]
-    n_args = len(arg_scalar_types)
+    _, _, *scalar_strs = kernel.arg_types
+    scalar_type = _SCALAR_IR_TYPE[kernel.return_type]
+    arg_types = tuple(_SCALAR_IR_TYPE[name] for name in scalar_strs)
+    storage_type = (
+        scalar_type
+        if kernel.n_outputs == 1
+        else ir.ArrayType(scalar_type, kernel.n_outputs)
+    )
 
     module = ir.Module(name="numba_enzyme_driver")
     module.triple, module.data_layout = _target_lines(kernel.ir)
 
-    excinfo_ptr_type = _EXCINFO_STRUCT.as_pointer()
-    kernel_func_type = ir.FunctionType(
-        ir.IntType(32),
-        [
-            ret_scalar_type.as_pointer(),
-            excinfo_ptr_type.as_pointer(),
-            *arg_scalar_types,
-        ],
+    kernel_fn = ir.Function(
+        module,
+        ir.FunctionType(
+            ir.IntType(32),
+            [
+                storage_type.as_pointer(),
+                _EXCINFO_PTR_TYPE.as_pointer(),
+                *arg_types,
+            ],
+        ),
+        name=kernel.entry_symbol,
     )
-    kernel_fn = ir.Function(module, kernel_func_type, name=kernel.entry_symbol)
-
     enzyme_dup = ir.GlobalVariable(module, ir.IntType(32), name="enzyme_dup")
     enzyme_dup.linkage = "external"
     enzyme_const = ir.GlobalVariable(module, ir.IntType(32), name="enzyme_const")
     enzyme_const.linkage = "external"
 
-    i8p = ir.IntType(8).as_pointer()
-    grad_symbol = f"grad_{kernel.entry_symbol}"
-    jvp_symbol = f"jvp_{kernel.entry_symbol}"
+    primal = _Primal(
+        kernel=kernel,
+        module=module,
+        function=kernel_fn,
+        dup=enzyme_dup,
+        const=enzyme_const,
+        arg_types=arg_types,
+        scalar_type=scalar_type,
+        storage_type=storage_type,
+    )
 
-    # ---- reverse mode: grad_<entry> ----
-    # Enzyme packs the gradients of multiple active by-value args into a
-    # literal struct internally; a single active arg gets a bare scalar.
-    # That struct never crosses an external ABI boundary: grad_<entry>
-    # itself is void and takes an explicit `out` pointer, uniformly for
-    # every n_args, so we never have to replicate the platform's small-
-    # vs-large-aggregate return classification ourselves. (A first draft
-    # returned the struct directly from grad_<entry> -- silently wrong
-    # for n_args=3, a 24-byte struct exceeding x86-64 SysV's 16-byte
-    # register-return threshold, since our hand-built IR never lowered
-    # it to the required hidden-pointer/sret convention the way a real C
-    # frontend would.)
+    # Enzyme packs gradients of active by-value arguments into a literal
+    # struct. Keep that aggregate internal and expose one output pointer per
+    # argument, avoiding platform aggregate-return conventions and preserving
+    # each argument's own derivative type.
     grad_ret_type = (
-        ret_scalar_type
-        if n_args == 1
-        else ir.LiteralStructType([ret_scalar_type] * n_args)
+        arg_types[0] if len(arg_types) == 1 else ir.LiteralStructType(list(arg_types))
     )
     autodiff_fn = ir.Function(
         module,
-        ir.FunctionType(grad_ret_type, [i8p], var_arg=True),
+        ir.FunctionType(grad_ret_type, [_I8P], var_arg=True),
         name="__enzyme_autodiff",
     )
 
-    out_ptr_type = ret_scalar_type.as_pointer()
-    grad_fn = ir.Function(
-        module,
-        ir.FunctionType(ir.VoidType(), [out_ptr_type, *arg_scalar_types]),
-        name=grad_symbol,
-    )
-    grad_fn.args[0].name = "out"
-    for i, arg in enumerate(grad_fn.args[1:]):
-        arg.name = f"x{i}"
-    out_ptr, *grad_inputs = grad_fn.args
-    b = ir.IRBuilder(grad_fn.append_basic_block("entry"))
-
-    result_ptr = b.alloca(ret_scalar_type, name="result")
-    b.store(ir.Constant(ret_scalar_type, 0.0), result_ptr)
-    d_result_ptr = b.alloca(ret_scalar_type, name="d_result")
-    b.store(ir.Constant(ret_scalar_type, 1.0), d_result_ptr)
-    excinfo_local = b.alloca(excinfo_ptr_type, name="excinfo")
-    b.store(ir.Constant(excinfo_ptr_type, None), excinfo_local)
-
-    kernel_i8p = b.bitcast(kernel_fn, i8p)
-    call_args = [
-        kernel_i8p,
-        b.load(enzyme_dup),
-        result_ptr,
-        d_result_ptr,
-        b.load(enzyme_const),
-        excinfo_local,
-        *grad_inputs,
-    ]
-    grad_result = b.call(autodiff_fn, call_args)
-    if n_args == 1:
-        b.store(grad_result, out_ptr)
-    else:
-        for i in range(n_args):
-            elem = b.extract_value(grad_result, i)
-            elem_ptr = b.gep(out_ptr, [ir.Constant(ir.IntType(32), i)], inbounds=True)
-            b.store(elem, elem_ptr)
-    b.ret_void()
-
-    # ---- forward mode: jvp_<entry> ----
-    # Every active arg is a (primal, tangent) dup pair; the JVP always
-    # lands in d_result's shadow regardless of n_args.
-    jvp_arg_types = []
-    for t in arg_scalar_types:
-        jvp_arg_types.extend([t, t])
-    fwddiff_fn = ir.Function(
-        module,
-        ir.FunctionType(ret_scalar_type, [i8p], var_arg=True),
-        name="__enzyme_fwddiff",
-    )
-
-    jvp_fn = ir.Function(
-        module, ir.FunctionType(ret_scalar_type, jvp_arg_types), name=jvp_symbol
-    )
-    for i in range(n_args):
-        jvp_fn.args[2 * i].name = f"x{i}"
-        jvp_fn.args[2 * i + 1].name = f"dx{i}"
-    b2 = ir.IRBuilder(jvp_fn.append_basic_block("entry"))
-
-    result_ptr2 = b2.alloca(ret_scalar_type, name="result")
-    b2.store(ir.Constant(ret_scalar_type, 0.0), result_ptr2)
-    d_result_ptr2 = b2.alloca(ret_scalar_type, name="d_result")
-    b2.store(ir.Constant(ret_scalar_type, 0.0), d_result_ptr2)
-    excinfo_local2 = b2.alloca(excinfo_ptr_type, name="excinfo")
-    b2.store(ir.Constant(excinfo_ptr_type, None), excinfo_local2)
-
-    kernel_i8p2 = b2.bitcast(kernel_fn, i8p)
-    call_args2 = [
-        kernel_i8p2,
-        b2.load(enzyme_dup),
-        result_ptr2,
-        d_result_ptr2,
-        b2.load(enzyme_const),
-        excinfo_local2,
-    ]
-    for i in range(n_args):
-        call_args2.append(b2.load(enzyme_dup))
-        call_args2.append(jvp_fn.args[2 * i])
-        call_args2.append(jvp_fn.args[2 * i + 1])
-    b2.call(fwddiff_fn, call_args2)
-    b2.ret(b2.load(d_result_ptr2))
-
+    jvp_symbol = _synthesise_jvp(primal)
+    vjp_symbol = _synthesise_vjp(primal, autodiff_fn)
     return SynthesisedDriver(
-        ir=str(module), grad_symbol=grad_symbol, jvp_symbol=jvp_symbol
+        ir=str(module), jvp_symbol=jvp_symbol, vjp_symbol=vjp_symbol
     )

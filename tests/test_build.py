@@ -5,6 +5,7 @@ behavior (hit/miss).
 
 import math
 
+import numba as nb
 import pytest
 
 from numba_enzyme.build import build
@@ -18,6 +19,10 @@ def f(x: Float64) -> Float64:
 
 def g(x: Float64, y: Float64) -> Float64:
     return math.sin(x) * y + x * y * y
+
+
+def vector(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x + y
 
 
 @pytest.fixture(autouse=True)
@@ -74,3 +79,33 @@ def test_different_function_is_a_cache_miss():
     second = build(g)
     assert first.path != second.path
     assert second.from_cache is False
+
+
+def test_vector_output_metadata_survives_a_cache_hit():
+    first = build(vector)
+    second = build(vector)
+
+    assert first.n_outputs == second.n_outputs == 2
+    assert first.return_type == second.return_type == "double"
+    assert first.arg_types == second.arg_types == ("double", "double")
+    assert second.vjp_symbol == first.vjp_symbol
+    assert second.jvp_symbol == first.jvp_symbol
+    assert second.from_cache is True
+    assert load(second).jvp((2.0, 3.0), (0.0, 1.0)) == pytest.approx((2.0, 1.0))
+    assert load(second).vjp((2.0, 3.0), (0.0, 1.0)) == pytest.approx((1.0, 1.0))
+
+
+def plain(x, y):
+    return x * y
+
+
+def test_inferred_argument_types_are_part_of_the_cache_key():
+    double = build(plain, (nb.types.float64, nb.types.float64))
+    single = build(plain, (nb.types.float32, nb.types.float32))
+    assert double.path != single.path
+    assert (double.return_type, single.return_type) == ("double", "float")
+
+    again = build(plain, (nb.types.float64, nb.types.float64))
+    assert again.from_cache is True
+    assert again.path == double.path
+    assert load(again).grad(2.0, 3.0) == pytest.approx((3.0, 2.0))
