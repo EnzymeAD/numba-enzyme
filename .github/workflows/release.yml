@@ -28,9 +28,22 @@ jobs:
       - name: Check the metadata PyPI will read
         run: uvx twine check --strict dist/*
 
-      # The wheel is only worth anything if the toolchain inside it survived
-      # the build with its permissions intact, and nothing else here would
-      # notice if it had not.
+      # Install it and import it. Unpacking the wheel and running the binaries
+      # is not enough: 0.2.0 shipped unimportable, because __init__ looked its
+      # own version up under the distribution name this fork no longer uses,
+      # and nothing in this job touched Python's view of the package.
+      - name: Check the wheel installs and imports
+        run: |
+          uv venv --python 3.13 /tmp/check
+          VIRTUAL_ENV=/tmp/check uv pip install dist/*.whl
+          /tmp/check/bin/python -c "
+          import numba_enzyme
+          print('numba_enzyme', numba_enzyme.__version__)
+          from numba_enzyme import grad, jacfwd, jacrev, jvp, vjp
+          "
+
+      # The toolchain has to have survived the build with its permissions
+      # intact, and nothing else here would notice if it had not.
       - name: Check the vendored toolchain runs
         run: |
           python -m zipfile -e dist/*.whl unpacked/

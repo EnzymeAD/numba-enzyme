@@ -6,7 +6,7 @@
 # version is this distribution's own: it carries upstream 0.1.3 plus the CUDA
 # backend and the composable, tuple-shaped `jvp` menodax drove.
 name = "numba-enzyme-cuda"
-version = "0.2.0"
+version = "0.2.1"
 description = "Differentiate Numba-compiled Python and CUDA device functions with the standalone Enzyme LLVM plugin."
 readme = "README.md"
 license = "Apache-2.0 WITH LLVM-exception"

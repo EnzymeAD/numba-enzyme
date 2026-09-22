@@ -27,7 +27,7 @@ Examples
 (1.0806046117362795, 0.8414709848078965)
 """
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 from numba_enzyme.core import (
     Differentiable,
@@ -39,7 +39,14 @@ from numba_enzyme.core import (
     vjp,
 )
 
-__version__ = version("numba-enzyme")
+# The distribution is numba-enzyme-cuda; upstream's name is the fallback, so
+# this package imports whichever of the two supplied it. Looking up only the
+# name it was published under is what made the first numba-enzyme-cuda wheel
+# fail at import.
+try:
+    __version__ = version("numba-enzyme-cuda")
+except PackageNotFoundError:  # pragma: no cover - upstream distribution
+    __version__ = version("numba-enzyme")
 
 __all__ = [
     "Differentiable",
