@@ -126,7 +126,7 @@ def _toolchain_fingerprint() -> str:
     """
     tc = get_toolchain()
     parts = []
-    for path in (tc.clang, tc.llvm_link, tc.opt, tc.enzyme_plugin):
+    for path in (tc.clang, tc.llvm_link, tc.opt, tc.llvm_extract, tc.enzyme_plugin):
         stat = path.stat()
         parts.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
     return "|".join(parts)
@@ -276,12 +276,28 @@ def build(func: Callable) -> BuiltKernel:
     tc = get_toolchain()
 
     entry_dir.mkdir(parents=True, exist_ok=True)
+    kernel_full_ll = entry_dir / "kernel_full.ll"
     kernel_ll = entry_dir / "kernel.ll"
     driver_ll = entry_dir / "driver.ll"
     combined_ll = entry_dir / "combined.ll"
     enzyme_out_ll = entry_dir / "enzyme_out.ll"
 
-    kernel_ll.write_text(kernel.ir)
+    # extract the entry function and discard
+    # the irrelevant part of the IR.
+    kernel_full_ll.write_text(kernel.ir)
+    subprocess.run(
+        [
+            str(tc.llvm_extract),
+            f"--func={kernel.entry_symbol}",
+            "--recursive",
+            "--keep-const-init",
+            str(kernel_full_ll),
+            "-S",
+            "-o",
+            str(kernel_ll),
+        ],
+        check=True,
+    )
     driver_ll.write_text(drv.ir)
 
     subprocess.run(

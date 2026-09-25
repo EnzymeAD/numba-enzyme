@@ -141,3 +141,34 @@ def f_array_allocates(x: Array1D(Float64)) -> Float64:
 def test_lower_rejects_kernel_body_that_needs_nrt():
     with pytest.raises(LoweringError, match="NRT"):
         lower(f_array_allocates)
+
+
+def f_array_reshape(x: Array1D(Float64)) -> Float64:
+    y = x.reshape(x.shape[0], 1)
+    s = 0.0
+    for i in range(y.shape[0]):
+        s += y[i, 0] * y[i, 0]
+    return s
+
+
+def test_lower_allows_refcount_only_nrt_calls():
+    result = lower(f_array_reshape)
+    assert "@NRT_incref" in result.ir
+    assert "@NRT_decref" in result.ir
+    assert "@NRT_MemInfo_alloc_aligned" not in result.ir
+
+
+def test_lower_marks_nrt_dtor_nofree_and_inactive():
+    result = lower(f_array_reshape)
+    dtor_line = next(
+        line
+        for line in result.ir.splitlines()
+        if "declare" in line and "NRT_MemInfo_call_dtor" in line
+    )
+    assert "nofree" in dtor_line
+    assert '"enzyme_inactive"' in dtor_line
+
+
+def test_lower_still_rejects_nrt_allocation_calls():
+    with pytest.raises(LoweringError, match="NRT_MemInfo_alloc_aligned"):
+        lower(f_array_allocates)

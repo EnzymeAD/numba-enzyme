@@ -9,7 +9,7 @@ def test_get_toolchain_resolves_existing_executables():
     get_toolchain.cache_clear()
     tc = get_toolchain()
     assert isinstance(tc, Toolchain)
-    for path in (tc.clang, tc.llvm_link, tc.opt):
+    for path in (tc.clang, tc.llvm_link, tc.opt, tc.llvm_extract):
         assert path.is_file()
         assert os.access(path, os.X_OK)
     assert tc.enzyme_plugin.is_file()
@@ -39,7 +39,7 @@ def _make_fake_vendor_dir(tmp_path):
     bin_dir.mkdir()
     enzyme_dir = tmp_path / "enzyme"
     enzyme_dir.mkdir()
-    for name in ("clang", "llvm-link", "opt"):
+    for name in ("clang", "llvm-link", "opt", "llvm-extract"):
         fake = bin_dir / name
         fake.write_bytes(b"#!/bin/sh\n")
         fake.chmod(0o755)
@@ -57,6 +57,7 @@ def test_vendored_toolchain_is_preferred_when_present(monkeypatch, tmp_path):
     assert tc.clang == vendor_dir / "bin" / "clang"
     assert tc.llvm_link == vendor_dir / "bin" / "llvm-link"
     assert tc.opt == vendor_dir / "bin" / "opt"
+    assert tc.llvm_extract == vendor_dir / "bin" / "llvm-extract"
     assert tc.enzyme_plugin == vendor_dir / "enzyme" / "LLVMEnzyme-15.so"
     get_toolchain.cache_clear()
 
