@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # CIBW_BEFORE_ALL: runs once per platform container, before any
 # per-Python-version wheel build starts. Builds LLVMEnzyme-15.so from
-# the pinned Enzyme release and stages it plus clang/opt/llvm-link/ld.lld
-# into a location that persists for the rest of this cibuildwheel session
+# the pinned Enzyme release and stages it plus clang/opt/llvm-link/
+# llvm-extract/ld.lld into a location that persists for the rest of this
+# cibuildwheel session
 # (packaging/cibw_before_build.sh copies from here into
 # src/numba_enzyme/_vendor/ before each per-Python-version build).
 #
@@ -35,6 +36,7 @@ cp "$WORK_DIR/enzyme-build/Enzyme/LLVMEnzyme-15.so" "$STAGING_DIR/enzyme/LLVMEnz
 cp /usr/lib/llvm-15/bin/clang "$STAGING_DIR/bin/clang"
 cp /usr/lib/llvm-15/bin/opt "$STAGING_DIR/bin/opt"
 cp /usr/lib/llvm-15/bin/llvm-link "$STAGING_DIR/bin/llvm-link"
+cp /usr/lib/llvm-15/bin/llvm-extract "$STAGING_DIR/bin/llvm-extract"
 # `clang -shared` shells out to a separate linker executable for the
 # final link step -- vendoring lld (LLVM's own linker) as `ld.lld`
 # right next to clang keeps this self-contained with no system linker
