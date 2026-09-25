@@ -1,7 +1,7 @@
 """
 Locate the required external build tools.
 
-Resolves the ``clang``/``llvm-link``/``opt`` binaries
+Resolves the `clang`/`llvm-link`/`opt`/`llvm-extract` binaries
 and the standalone Enzyme LLVM pass plugin. Prioritise
 the `_vendor/` directory shipped alongside this module,
 and falls back to the system-installed, ``PATH``-resolved
@@ -62,13 +62,15 @@ class Toolchain:
     Attributes
     ----------
     clang : pathlib.Path
-        Path to the ``clang-15`` executable.
+        Path to the `clang-15` executable.
     llvm_link : pathlib.Path
-        Path to the ``llvm-link-15`` executable.
+        Path to the `llvm-link-15` executable.
     opt : pathlib.Path
         Path to the ``opt-15`` executable.
+    llvm_extract : pathlib.Path
+        Path to the `llvm-extract-15` executable.
     enzyme_plugin : pathlib.Path
-        Path to the standalone Enzyme LLVM pass plugin (``LLVMEnzyme-15.so``).
+        Path to the standalone Enzyme LLVM pass plugin (`LLVMEnzyme-15.so`).
 
     See Also
     --------
@@ -84,6 +86,7 @@ class Toolchain:
     clang: Path
     llvm_link: Path
     opt: Path
+    llvm_extract: Path
     enzyme_plugin: Path
 
 
@@ -139,6 +142,7 @@ def _resolve_vendored() -> Toolchain | None:
         clang=vendored_clang,
         llvm_link=_VENDOR_DIR / "bin" / "llvm-link",
         opt=_VENDOR_DIR / "bin" / "opt",
+        llvm_extract=_VENDOR_DIR / "bin" / "llvm-extract",
         enzyme_plugin=_VENDOR_DIR / "enzyme" / "LLVMEnzyme-15.so",
     )
 
@@ -167,6 +171,7 @@ def _resolve_system() -> tuple[Toolchain | None, list[str]]:
     clang = _which("clang-15")
     llvm_link = _which("llvm-link-15")
     opt = _which("opt-15")
+    llvm_extract = _which("llvm-extract-15")
 
     plugin_override = os.environ.get(_PLUGIN_PATH_ENV_VAR)
     enzyme_plugin = Path(plugin_override) if plugin_override else _DEFAULT_PLUGIN_PATH
@@ -178,6 +183,8 @@ def _resolve_system() -> tuple[Toolchain | None, list[str]]:
         missing.append("llvm-link-15 (not found on PATH)")
     if opt is None:
         missing.append("opt-15 (not found on PATH)")
+    if llvm_extract is None:
+        missing.append("llvm-extract-15 (not found on PATH)")
     if not enzyme_plugin.is_file():
         missing.append(
             f"Enzyme plugin (not found at {enzyme_plugin}; "
@@ -188,7 +195,11 @@ def _resolve_system() -> tuple[Toolchain | None, list[str]]:
 
     return (
         Toolchain(
-            clang=clang, llvm_link=llvm_link, opt=opt, enzyme_plugin=enzyme_plugin
+            clang=clang,
+            llvm_link=llvm_link,
+            opt=opt,
+            llvm_extract=llvm_extract,
+            enzyme_plugin=enzyme_plugin,
         ),
         [],
     )
@@ -240,7 +251,12 @@ def get_toolchain() -> Toolchain:
                 "missing required build tool(s):\n  - " + "\n  - ".join(missing)
             )
 
-    for tool in (toolchain.clang, toolchain.llvm_link, toolchain.opt):
+    for tool in (
+        toolchain.clang,
+        toolchain.llvm_link,
+        toolchain.opt,
+        toolchain.llvm_extract,
+    ):
         if not tool.is_file():
             raise ToolchainError(f"{tool} does not exist")
         if not os.access(tool, os.X_OK):
