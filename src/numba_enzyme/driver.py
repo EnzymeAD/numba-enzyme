@@ -182,9 +182,15 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     >>> synthesise(lower(f)).grad_symbol  # doctest: +SKIP
     'grad__ZN...'
     """
-    retptr_str, _, *flat_strs = kernel.arg_types
-    ret_scalar_type = _SCALAR_IR_TYPE[retptr_str[:-1]]
+    _, _, *flat_strs = kernel.arg_types
+    ret_scalar_type = _SCALAR_IR_TYPE[kernel.return_type]
     flat_types = [_ir_type_from_str(s) for s in flat_strs]
+    n_outputs = kernel.n_outputs
+    # A tuple result is returned through a pointer to an array of its
+    # components rather than to a single scalar.
+    ret_storage_type = (
+        ret_scalar_type if n_outputs == 1 else ir.ArrayType(ret_scalar_type, n_outputs)
+    )
 
     module = ir.Module(name="numba_enzyme_driver")
     module.triple, module.data_layout = _target_lines(kernel.ir)
@@ -193,7 +199,7 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     kernel_func_type = ir.FunctionType(
         ir.IntType(32),
         [
-            ret_scalar_type.as_pointer(),
+            ret_storage_type.as_pointer(),
             excinfo_ptr_type.as_pointer(),
             *flat_types,
         ],
@@ -337,7 +343,9 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     # would.) Array arguments never go through `out` at all -- Enzyme
     # accumulates their gradient in place into a caller-owned shadow
     # buffer (see `_array_call_args`), so each array argument instead
-    # gets its own dedicated group of parameters below.
+    # gets its own dedicated group of parameters below. A tuple result
+    # seeds every component with one, giving the gradient of their sum; the
+    # runtime never calls it, since grad rejects tuple outputs.
     grad_ret_type = (
         ir.VoidType()
         if n_scalar_args == 0
@@ -368,10 +376,11 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
         arg.name = name
 
     b = ir.IRBuilder(grad_fn.append_basic_block("entry"))
-    result_ptr = b.alloca(ret_scalar_type, name="result")
-    b.store(ir.Constant(ret_scalar_type, 0.0), result_ptr)
-    d_result_ptr = b.alloca(ret_scalar_type, name="d_result")
-    b.store(ir.Constant(ret_scalar_type, 1.0), d_result_ptr)
+    result_ptr = b.alloca(ret_storage_type, name="result")
+    b.store(ir.Constant(ret_storage_type, None), result_ptr)
+    d_result_ptr = b.alloca(ret_storage_type, name="d_result")
+    seed = 1.0 if n_outputs == 1 else [1.0] * n_outputs
+    b.store(ir.Constant(ret_storage_type, seed), d_result_ptr)
     excinfo_local = b.alloca(excinfo_ptr_type, name="excinfo")
     b.store(ir.Constant(excinfo_ptr_type, None), excinfo_local)
     kernel_i8p = b.bitcast(kernel_fn, i8p)
@@ -427,7 +436,9 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     # convention to lean on); the JVP always lands in d_result's shadow.
     # Each array arg gets the same dedicated parameter group as in
     # grad_<entry>, except its `d_data` slot is the caller-supplied
-    # *tangent* (seed) buffer rather than an output accumulator.
+    # *tangent* (seed) buffer rather than an output accumulator. A scalar
+    # result returns the JVP directly; a tuple result copies it through a
+    # trailing `out` pointer instead.
     fwddiff_fn = ir.Function(
         module,
         ir.FunctionType(ret_scalar_type, [i8p], var_arg=True),
@@ -442,20 +453,25 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
             jvp_params.append((f"dx{i}", t))
         else:
             jvp_params += _array_param_group(f"x{i}", spec)
+    if n_outputs != 1:
+        jvp_params.append(("out", ret_storage_type.as_pointer()))
 
     jvp_fn = ir.Function(
         module,
-        ir.FunctionType(ret_scalar_type, [t for _, t in jvp_params]),
+        ir.FunctionType(
+            ret_scalar_type if n_outputs == 1 else ir.VoidType(),
+            [t for _, t in jvp_params],
+        ),
         name=jvp_symbol,
     )
     for arg, (name, _) in zip(jvp_fn.args, jvp_params):
         arg.name = name
 
     b2 = ir.IRBuilder(jvp_fn.append_basic_block("entry"))
-    result_ptr2 = b2.alloca(ret_scalar_type, name="result")
-    b2.store(ir.Constant(ret_scalar_type, 0.0), result_ptr2)
-    d_result_ptr2 = b2.alloca(ret_scalar_type, name="d_result")
-    b2.store(ir.Constant(ret_scalar_type, 0.0), d_result_ptr2)
+    result_ptr2 = b2.alloca(ret_storage_type, name="result")
+    b2.store(ir.Constant(ret_storage_type, None), result_ptr2)
+    d_result_ptr2 = b2.alloca(ret_storage_type, name="d_result")
+    b2.store(ir.Constant(ret_storage_type, None), d_result_ptr2)
     excinfo_local2 = b2.alloca(excinfo_ptr_type, name="excinfo")
     b2.store(ir.Constant(excinfo_ptr_type, None), excinfo_local2)
     kernel_i8p2 = b2.bitcast(kernel_fn, i8p)
@@ -493,7 +509,11 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
                 strides,
             )
     b2.call(fwddiff_fn, call_args2)
-    b2.ret(b2.load(d_result_ptr2))
+    if n_outputs == 1:
+        b2.ret(b2.load(d_result_ptr2))
+    else:
+        b2.store(b2.load(d_result_ptr2), jvp_fn.args[-1])
+        b2.ret_void()
 
     return SynthesisedDriver(
         ir=str(module), grad_symbol=grad_symbol, jvp_symbol=jvp_symbol

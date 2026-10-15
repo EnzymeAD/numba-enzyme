@@ -20,6 +20,10 @@ def g(x: Float64, y: Float64) -> Float64:
     return math.sin(x) * y + x * y * y
 
 
+def tuple_valued(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x + y
+
+
 @pytest.fixture(autouse=True)
 def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("NUMBA_ENZYME_CACHE_DIR", str(tmp_path))
@@ -74,3 +78,13 @@ def test_different_function_is_a_cache_miss():
     second = build(g)
     assert first.path != second.path
     assert second.from_cache is False
+
+
+def test_tuple_output_metadata_survives_a_cache_hit():
+    first = build(tuple_valued)
+    second = build(tuple_valued)
+
+    assert first.n_outputs == second.n_outputs == 2
+    assert second.jvp_symbol == first.jvp_symbol
+    assert second.from_cache is True
+    assert load(second).jvp((2.0, 3.0), (0.0, 1.0)) == pytest.approx((2.0, 1.0))

@@ -4,8 +4,9 @@ Load a built shared object and expose it as plain Python callables.
 Wraps a `numba_enzyme.build.BuiltKernel`'s `grad_<entry>``/
 `jvp_<entry>` symbols with :mod:`ctypes`.
 `grad_<entry>` is void and writes through an explicit output pointer
-uniformly for every arity. `jvp_<entry>` always returns a bare `float`
-regardless of arity.
+uniformly for every arity. `jvp_<entry>` returns a bare `float` for a
+scalar result, regardless of arity, and writes through a trailing output
+pointer for a tuple result.
 
 See Also
 --------
@@ -121,14 +122,17 @@ class Differentiable:
     grad : callable
         Computes the reverse-mode gradient. Takes `n_args` positional
         arguments and returns a `tuple` of `n_args`; raises `TypeError`
-        if called with the wrong number of arguments.
+        if called with the wrong number of arguments or on a tuple result.
     jvp : callable
         Computes the forward-mode Jacobian-vector product. Takes a
         `tuple` of `n_args` primal values and a `tuple` of `n_args`
-        tangent values, and returns a single `float`; raises
-        `TypeError` if either tuple has the wrong length.
+        tangent values, and returns a single `float`, or a `tuple` of
+        `n_outputs` for a tuple result; raises `TypeError` if either
+        tuple has the wrong length.
     n_args : int
         Number of scalar arguments the underlying function takes.
+    n_outputs : int
+        Number of scalar output components.
 
     See Also
     --------
@@ -146,8 +150,9 @@ class Differentiable:
     """
 
     grad: Callable[..., tuple[float, ...]]
-    jvp: Callable[[tuple[float, ...], tuple[float, ...]], float]
+    jvp: Callable[[tuple[float, ...], tuple[float, ...]], float | tuple[float, ...]]
     n_args: int
+    n_outputs: int
 
 
 def load(built: BuiltKernel) -> Differentiable:
@@ -182,6 +187,7 @@ def load(built: BuiltKernel) -> Differentiable:
     """
     lib = ctypes.CDLL(str(built.path))
     n = built.n_args
+    m = built.n_outputs
     arg_specs = built.arg_specs
     n_scalar = sum(1 for spec in arg_specs if spec.kind == "scalar")
 
@@ -202,6 +208,10 @@ def load(built: BuiltKernel) -> Differentiable:
     jvp_fn = getattr(lib, built.jvp_symbol)
     jvp_fn.restype = ctypes.c_double
     jvp_fn.argtypes = jvp_argtypes
+    if m != 1:
+        # A tuple result's tangent is written through a trailing out pointer.
+        jvp_fn.restype = None
+        jvp_fn.argtypes += (ctypes.POINTER(ctypes.c_double),)
 
     def grad(*xs) -> tuple:
         """
@@ -223,9 +233,9 @@ def load(built: BuiltKernel) -> Differentiable:
         Raises
         ------
         TypeError
-            If the number of arguments given doesn't match `n_args`,
-            or an argument's Python type doesn't match its declared
-            scalar/array kind.
+            If the underlying function has a tuple result, the number of
+            arguments given doesn't match `n_args`, or an argument's Python
+            type doesn't match its declared scalar/array kind.
 
         Examples
         --------
@@ -237,6 +247,10 @@ def load(built: BuiltKernel) -> Differentiable:
         >>> load(build(f)).grad(2.0)  # doctest: +SKIP
         (4.0,)
         """
+        if m != 1:
+            raise TypeError(
+                "grad requires a scalar-output function; use jvp for tuple outputs"
+            )
         if len(xs) != n:
             raise TypeError(f"expected {n} arguments, got {len(xs)}")
 
@@ -278,7 +292,7 @@ def load(built: BuiltKernel) -> Differentiable:
                 scalar_i += 1
         return tuple(results)
 
-    def jvp(xs: tuple, seed: tuple) -> float:
+    def jvp(xs: tuple, seed: tuple) -> float | tuple[float, ...]:
         """
         Compute the forward-mode Jacobian-vector product.
 
@@ -294,9 +308,10 @@ def load(built: BuiltKernel) -> Differentiable:
 
         Returns
         -------
-        float
+        float or tuple of float
             The directional derivative of the underlying function at
-            `xs` in direction `seed`.
+            `xs` in direction `seed`, one value per output component for
+            a tuple result.
 
         Raises
         ------
@@ -341,6 +356,10 @@ def load(built: BuiltKernel) -> Differentiable:
                     *shape,
                     *strides,
                 ]
-        return jvp_fn(*call_args)
+        if m == 1:
+            return jvp_fn(*call_args)
+        out = (ctypes.c_double * m)()
+        jvp_fn(*call_args, out)
+        return tuple(out)
 
-    return Differentiable(grad=grad, jvp=jvp, n_args=n)
+    return Differentiable(grad=grad, jvp=jvp, n_args=n, n_outputs=m)

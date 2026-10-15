@@ -53,6 +53,8 @@ class BuiltKernel:
         Name of the forward-mode entry point exported by `path`.
     n_args : int
         Number of scalar arguments the original function takes.
+    n_outputs : int
+        Number of scalar output components.
     from_cache : bool
         Whether the shared object was loaded from the disk.
 
@@ -74,6 +76,7 @@ class BuiltKernel:
     grad_symbol: str
     jvp_symbol: str
     n_args: int
+    n_outputs: int
     arg_specs: tuple[ArgSpec, ...]
     from_cache: bool
 
@@ -260,6 +263,7 @@ def build(func: Callable) -> BuiltKernel:
                 "grad_symbol": raw_meta["grad_symbol"],
                 "jvp_symbol": raw_meta["jvp_symbol"],
                 "n_args": raw_meta["n_args"],
+                "n_outputs": raw_meta["n_outputs"],
                 "arg_specs": tuple(ArgSpec(**spec) for spec in raw_meta["arg_specs"]),
             }
         except (KeyError, TypeError):
@@ -380,6 +384,7 @@ def build(func: Callable) -> BuiltKernel:
         "grad_symbol": drv.grad_symbol,
         "jvp_symbol": drv.jvp_symbol,
         "n_args": kernel.n_args,
+        "n_outputs": kernel.n_outputs,
         "arg_specs": kernel.arg_specs,
     }
     meta_path.write_text(json.dumps(meta, default=vars))

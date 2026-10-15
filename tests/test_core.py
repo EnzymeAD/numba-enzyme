@@ -19,6 +19,10 @@ def f_grad(x, y):
     return (math.cos(x) * y + y * y, math.sin(x) + 2 * x * y)
 
 
+def f_tuple(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x * x + y
+
+
 # Decorated at module level -- must stay cheap (no build triggered by
 # decoration itself, only by actually accessing .grad/.jvp), otherwise
 # just importing this test module would build outside the isolated cache
@@ -44,6 +48,11 @@ def test_jvp_matches_analytic():
     j = jvp(f)
     assert j((x, y), (1.0, 0.0)) == pytest.approx(expected[0], abs=1e-9)
     assert j((x, y), (0.0, 1.0)) == pytest.approx(expected[1], abs=1e-9)
+
+
+def test_grad_rejects_tuple_output():
+    with pytest.raises(TypeError, match="grad requires a scalar-output function"):
+        grad(f_tuple)(1.0, 2.0)
 
 
 def test_differentiable_wrapper_calls_original_function():

@@ -42,7 +42,8 @@ def grad(func: Callable) -> Callable[..., tuple[float, ...]]:
     -------
     callable
         Takes the same positional arguments as `func` and returns a
-        `tuple` holding the gradient with respect to each of them.
+        `tuple` holding the gradient with respect to each of them. Raises
+        `TypeError` if `func` returns a tuple.
 
     See Also
     --------
@@ -61,22 +62,24 @@ def grad(func: Callable) -> Callable[..., tuple[float, ...]]:
     return load(build(func)).grad
 
 
-def jvp(func: Callable) -> Callable[[tuple, tuple], float]:
+def jvp(func: Callable) -> Callable[[tuple, tuple], float | tuple]:
     """
     Return a callable, computing the forward-mode JVP of a function.
 
     Parameters
     ----------
     func : callable
-        A Python function whose parameters and return value are each
-        annotated with a `numba_enzyme.types` class.
+        A Python function whose parameters are each annotated with a
+        `numba_enzyme.types` class, and whose return value is annotated
+        with one or a fixed-size homogeneous tuple of them.
 
     Returns
     -------
     callable
         Takes a `tuple` of primal values and a `tuple` of tangent
         values (both the same length as `func`'s arguments) and returns
-        the Jacobian-vector product as a single `float`.
+        the Jacobian-vector product as a single `float`, or a `tuple`
+        with one value per output if `func` returns a tuple.
 
     See Also
     --------

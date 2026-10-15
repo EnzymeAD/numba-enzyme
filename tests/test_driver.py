@@ -41,6 +41,10 @@ def f3_grad(x, y, z):
     return (y, x + z, y + math.exp(z))
 
 
+def f_tuple(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x * x + y
+
+
 @pytest.fixture(autouse=True)
 def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("NUMBA_ENZYME_CACHE_DIR", str(tmp_path))
@@ -119,3 +123,40 @@ def test_grad_and_jvp_match_analytic_for_array_argument():
         seed[i] = 1.0
         got = diff.jvp((x,), (seed,))
         assert got == pytest.approx(farr_grad(x)[i], abs=1e-9)
+
+
+def test_tuple_output_forward_derivatives():
+    diff = load(build(f_tuple))
+    x, y = 1.3, 0.7
+
+    assert diff.n_outputs == 2
+    assert diff.jvp((x, y), (0.25, -0.5)) == pytest.approx(
+        (y * 0.25 + x * -0.5, 2 * x * 0.25 - 0.5), abs=1e-9
+    )
+
+
+def test_tuple_output_rejects_grad():
+    diff = load(build(f_tuple))
+
+    with pytest.raises(TypeError, match="scalar-output"):
+        diff.grad(1.3, 0.7)
+
+
+def farr_tuple(x: Array1D(Float64)) -> tuple[Float64, Float64]:
+    s = 0.0
+    p = 1.0
+    for i in range(x.shape[0]):
+        s += x[i]
+        p *= x[i]
+    return s, p
+
+
+def test_tuple_output_jvp_for_array_argument():
+    diff = load(build(farr_tuple))
+    x = np.array([1.0, 2.0, 3.0])
+
+    for i in range(len(x)):
+        seed = np.zeros_like(x)
+        seed[i] = 1.0
+        got = diff.jvp((x,), (seed,))
+        assert got == pytest.approx((1.0, np.prod(x) / x[i]), abs=1e-9)

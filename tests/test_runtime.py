@@ -16,6 +16,10 @@ def f(x: Float64, y: Float64) -> Float64:
     return math.sin(x) * y + x * y * y
 
 
+def f_tuple(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x + y
+
+
 @pytest.fixture(autouse=True)
 def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("NUMBA_ENZYME_CACHE_DIR", str(tmp_path))
@@ -41,6 +45,12 @@ def test_grad_rejects_wrong_arity():
     diff = load(build(f))
     with pytest.raises(TypeError):
         diff.grad(1.0)
+
+
+def test_grad_rejects_tuple_output():
+    diff = load(build(f_tuple))
+    with pytest.raises(TypeError, match="requires a scalar-output function"):
+        diff.grad(1.0, 2.0)
 
 
 def test_jvp_rejects_wrong_arity():
