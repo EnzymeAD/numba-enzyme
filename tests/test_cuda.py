@@ -192,6 +192,22 @@ def test_nvvm_sanitizer_rewrites_llvm_8_floating_point_spellings():
     assert "%i90 = phi double [ %i12, %a ], [ %i78, %b ]" in sanitized
 
 
+def test_nvvm_sanitizer_rewrites_optimiser_loop_guards():
+    """``freeze`` and the integer min/max intrinsics are LLVM 10 and 12 spellings."""
+
+    sanitized = _sanitize_for_libnvvm(
+        "  %smax = tail call i64 @llvm.smax.i64(i64 %jac_cols, i64 1)\n"
+        "  %i = freeze i64 %smax\n"
+        "  %n = call i32 @llvm.umin.i32(i32 %a, i32 7) #3\n"
+        "declare i64 @llvm.smax.i64(i64, i64) #0\n"
+        "declare i32 @llvm.umin.i32(i32, i32) #0\n"
+    )
+    assert "freeze" not in sanitized and "llvm.smax" not in sanitized and "llvm.umin" not in sanitized
+    assert "%smax.cmp = icmp sgt i64 %jac_cols, 1\n  %smax = select i1 %smax.cmp, i64 %jac_cols, i64 1" in sanitized
+    assert "%i = bitcast i64 %smax to i64" in sanitized
+    assert "%n.cmp = icmp ult i32 %a, 7\n  %n = select i1 %n.cmp, i32 %a, i32 7" in sanitized
+
+
 def test_core_returns_lazy_cuda_derivatives_without_compiling(monkeypatch):
     def fail_if_eager(*args, **kwargs):
         raise AssertionError("CUDA derivative was built eagerly")
@@ -1169,6 +1185,101 @@ def test_tuple_jvp_is_the_jacobian_applied_to_a_direction():
     )
     expected = _tuple_jacobian(1.5, 0.75) @ direction
     np.testing.assert_allclose(out.copy_to_host(), expected, rtol=1e-12)
+
+
+def test_prepasses_default_and_override(monkeypatch):
+    """The pre-Enzyme pipeline defaults to O3, can be replaced, and keys the cache."""
+
+    from numba_enzyme.cuda import _DEFAULT_PREPASSES, _PREPASSES_ENV_VAR, _prepasses
+
+    monkeypatch.delenv(_PREPASSES_ENV_VAR, raising=False)
+    assert _prepasses() == _DEFAULT_PREPASSES
+    monkeypatch.setenv(_PREPASSES_ENV_VAR, "function(mem2reg)")
+    assert _prepasses() == "function(mem2reg)"
+    for off in ("", "none", "OFF", "0"):
+        monkeypatch.setenv(_PREPASSES_ENV_VAR, off)
+        assert _prepasses() == ""
+
+    from numba_enzyme.cuda import _cuda_cache_key
+
+    def key():
+        return _cuda_cache_key(
+            tuple_device, (types.float64, types.float64), types.UniTuple(types.float64, 2),
+            (8, 9), frozenset({"jvp"}), "; ir",
+        )
+
+    monkeypatch.setenv(_PREPASSES_ENV_VAR, "none")
+    without = key()
+    monkeypatch.delenv(_PREPASSES_ENV_VAR)
+    assert key() != without
+
+
+N_LOOPED = 4
+
+
+@cuda.jit(device=True)
+def looped_device(y, t, p):
+    """A hierarchy written as loops: over a local array, and indexing the tuple."""
+
+    k, inv_tau = p[0], p[1]
+    x = cuda.local.array(N_LOOPED, types.float64)
+    dx = cuda.local.array(N_LOOPED, types.float64)
+    for i in range(N_LOOPED):
+        x[i] = y[i]  # a runtime index into the tuple argument
+    dx[0] = -k * x[1]
+    for l in range(1, N_LOOPED - 1):
+        dx[l] = k * (l * x[l - 1] - (l + 1) * x[l + 1]) * (1.0 / (2 * l + 1))
+    dx[N_LOOPED - 1] = k * x[N_LOOPED - 2] - N_LOOPED * x[N_LOOPED - 1] * inv_tau
+    return (dx[0], dx[1], dx[2], dx[3])
+
+
+def _looped_jacobian(k, inv_tau):
+    n = N_LOOPED
+    jac = np.zeros((n, n))
+    jac[0, 1] = -k
+    for l in range(1, n - 1):
+        jac[l, l - 1] = k * l / (2 * l + 1)
+        jac[l, l + 1] = -k * (l + 1) / (2 * l + 1)
+    jac[n - 1, n - 2] = k
+    jac[n - 1, n - 1] = -n * inv_tau
+    return jac
+
+
+def test_tuple_jvp_differentiates_loops_over_the_state():
+    """Loops over a local array and runtime tuple indices differentiate.
+
+    As lowered, each carries a bounds check whose failure path is a
+    ``cmpxchg`` Enzyme refuses; the O3 pipeline that runs before Enzyme
+    unrolls the loops and folds the checks away, so a callback need not be
+    hand-unrolled.
+    """
+
+    if not cuda.is_available():
+        pytest.skip("a CUDA GPU is not available")
+    _require_numba_cuda_mlir_compiler()
+
+    n = N_LOOPED
+    cc = cuda.get_current_device().compute_capability
+    signature = types.UniTuple(types.float64, n)(
+        types.UniTuple(types.float64, n), types.float64, types.UniTuple(types.float64, 2)
+    )
+    tangent_of = jvp(looped_device, signature=signature, cc=cc)
+
+    @cuda.jit
+    def kernel(y, t, p, seed, jac):
+        column = cuda.local.array(n, types.float64)
+        for col in range(n):
+            tangent_of(column, y, t, p, seed[col], 0.0, seed[n, 0:2])
+            for row in range(n):
+                jac[row, col] = column[row]
+
+    y = np.asarray([0.3, -1.2, 0.7, 2.1])
+    p = np.asarray([0.8, 0.25])
+    seeds = np.zeros((n + 1, n))
+    seeds[np.arange(n), np.arange(n)] = 1.0
+    jac = cuda.device_array((n, n), dtype=np.float64)
+    kernel[1, 1](cuda.to_device(y), 1.0, cuda.to_device(p), cuda.to_device(seeds), jac)
+    np.testing.assert_allclose(jac.copy_to_host(), _looped_jacobian(*p), rtol=1e-12, atol=1e-14)
 
 
 def test_tuple_jvp_composes_into_a_second_derivative():

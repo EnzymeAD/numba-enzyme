@@ -197,6 +197,16 @@ array-ness right. The direction set mirrors the primal's arguments, so seeding
 into the flattened arguments, and nothing to materialise in a shape the caller
 does not already have.
 
+**Loops.** The primal is run through LLVM's `O3` pipeline before Enzyme
+differentiates it (Enzyme is built for optimised IR), so a callback may be
+written with loops over a thread-local array or runtime indices into its
+tuple arguments. As lowered, each such index carries a bounds check whose
+failure path is an atomic Enzyme refuses; the pipeline unrolls the
+constant-trip-count loops, folds the checks away and promotes the local
+arrays to scalars, so what Enzyme sees is the hand-unrolled callback. The
+pipeline is the `opt -passes=` syntax in `NUMBA_ENZYME_CUDA_PREPASSES`;
+`none` disables it.
+
 `vjp` and `jacrev` accept either a scalar-returning or a tuple-returning
 primal, and tell them apart by how many arguments the call passes. They use the
 same output-by-input Jacobian layout:

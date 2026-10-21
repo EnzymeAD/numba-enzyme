@@ -35,7 +35,56 @@ from numba_enzyme.build import _cache_dir, _toolchain_fingerprint
 from numba_enzyme.toolchain import get_toolchain
 
 _CUDA_CC_ENV_VAR = "NUMBA_ENZYME_CUDA_CC"
-_CUDA_CACHE_SCHEMA = 7
+_CUDA_CACHE_SCHEMA = 9
+_PREPASSES_ENV_VAR = "NUMBA_ENZYME_CUDA_PREPASSES"
+_DEFAULT_PREPASSES = "default<O3>,function(sroa,instcombine)"
+_PREPASS_FLAGS = (
+    # libNVVM's LLVM 7 reader knows no vector reductions, and a callback
+    # differentiated for a per-thread ODE kernel wants no vectors anyway.
+    "-vectorize-slp=false",
+    "-vectorize-loops=false",
+    # Full unrolling is the point: a loop over a 16-multipole hierarchy whose
+    # body indexes a 50-element tuple is far above the default threshold of
+    # 300 instructions, and left rolled it keeps the bounds-check atomic.
+    "-unroll-threshold=100000",
+)
+_PREPASSES_OFF = frozenset({"", "none", "off", "0"})
+
+
+def _prepasses() -> str:
+    """
+    The LLVM pipeline run on the primal before Enzyme differentiates it.
+
+    Enzyme is built to differentiate *optimised* IR, and the primal that
+    Numba-CUDA-MLIR hands over is not: its ``range`` loops have a
+    data-dependent step and re-allocate their iterator every iteration, and
+    every runtime index into a tuple or a thread-local array carries a bounds
+    check whose failure path records the error with a ``cmpxchg`` on a global,
+    an atomic Enzyme stops at ("cannot handle unknown instruction"). A full
+    ``O3`` pipeline canonicalises the loops, unrolls those with a constant trip
+    count, folds the now-constant indices and with them the checks, and the
+    trailing ``sroa`` promotes the local arrays the loops wrote to scalars. The
+    primal Enzyme then sees is the same straight-line code a hand-unrolled
+    callback would have produced, so a callback may loop over its state.
+
+    It runs on the primal's module alone, before the synthesised driver is
+    linked in: the driver is already in the dialect libNVVM's LLVM 7 reader
+    accepts, and optimising its direction loops produced ``freeze`` and
+    ``llvm.smax`` that reader does not know. The vectorizers are off for the
+    same reason, and the unroll threshold is raised so that loops with
+    constant trip counts unroll whatever their body size (``_PREPASS_FLAGS``).
+    The pipeline is the ``opt -passes=`` syntax; ``NUMBA_ENZYME_CUDA_PREPASSES``
+    overrides it, and ``none`` (or empty) hands Enzyme the primal as lowered.
+
+    Returns
+    -------
+    str
+        The pass pipeline, empty when disabled.
+    """
+    value = os.environ.get(_PREPASSES_ENV_VAR)
+    if value is None:
+        return _DEFAULT_PREPASSES
+    return "" if value.strip().lower() in _PREPASSES_OFF else value.strip()
 _LOADED_CUDA_DERIVATIVES = {}
 _LOAD_LOCK = threading.RLock()
 _MLIR_COMPILE_LOCK = threading.RLock()
@@ -1697,6 +1746,7 @@ def _cuda_cache_key(
         "cuda_bindings": _package_version("cuda-bindings"),
         "cuda_backend_schema": _CUDA_CACHE_SCHEMA,
         "toolchain": _toolchain_fingerprint(),
+        "prepasses": _prepasses(),
     }
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
@@ -1816,6 +1866,33 @@ def _sanitize_for_libnvvm(llvm_ir: str) -> str:
         r"\1\2 ",
         llvm_ir,
     )
+
+    # LLVM 10 added ``freeze`` and LLVM 12 the integer ``llvm.{s,u}{min,max}``
+    # intrinsics; both come out of the optimiser's loop guards. A bitcast to
+    # the value's own type is the no-op LLVM 7 spells, and the intrinsics are
+    # a compare and a select.
+    llvm_ir = re.sub(
+        r"\bfreeze[ \t]+([^\s,]+)[ \t]+(%[^\s,]+)",
+        r"bitcast \1 \2 to \1",
+        llvm_ir,
+    )
+    predicates = {"smin": "slt", "smax": "sgt", "umin": "ult", "umax": "ugt"}
+
+    def min_max(match):
+        result, kind, ty, a, b = match.groups()
+        return (
+            f"{result}.cmp = icmp {predicates[kind]} {ty} {a}, {b}\n"
+            f"  {result} = select i1 {result}.cmp, {ty} {a}, {ty} {b}"
+        )
+
+    llvm_ir = re.sub(
+        r"(%[^\s=]+)[ \t]*=[ \t]*(?:tail[ \t]+)?call[ \t]+i\d+[ \t]+"
+        r"@llvm\.([su](?:min|max))\.(i\d+)\(i\d+[ \t]+([^\s,]+),[ \t]*i\d+[ \t]+([^\s)]+)\)"
+        r"[^\n]*",
+        min_max,
+        llvm_ir,
+    )
+    llvm_ir = re.sub(r"^declare[^\n]*@llvm\.[su](?:min|max)\.i\d+\([^\n]*\n", "", llvm_ir, flags=re.MULTILINE)
 
     # Enzyme expresses derivatives of libdevice calls using standard LLVM math
     # intrinsics.  CUDA 12's libNVVM rejects several of those intrinsics, but
@@ -2029,6 +2106,25 @@ def build_cuda(
     entry_dir.mkdir(parents=True, exist_ok=True)
     kernel_path = entry_dir / "kernel.ll"
     kernel_path.write_text(kernel.ir)
+    prepasses = _prepasses()
+    if prepasses:
+        # Optimise the primal before Enzyme differentiates it (``_prepasses``):
+        # this is what lets a callback loop over its state.
+        optimised_path = entry_dir / "kernel_opt.ll"
+        subprocess.run(
+            [
+                str(toolchain.opt),
+                "-opaque-pointers=0",
+                *_PREPASS_FLAGS,
+                f"-passes={prepasses}",
+                "-S",
+                str(kernel_path),
+                "-o",
+                str(optimised_path),
+            ],
+            check=True,
+        )
+        kernel_path = optimised_path
 
     # Enzyme preprocesses a callee before resolving a marker nested inside it,
     # so a reverse endpoint over a forward composition level cannot be built in
@@ -2071,17 +2167,16 @@ def build_cuda(
             combined_path.write_text(
                 _internalise_primal(combined_path.read_text(), kernel.entry_symbol)
             )
+        # The cleanup passes remove now-dead Enzyme marker declarations and
+        # activity globals before libNVVM sees the module. libNVVM's LLVM 7
+        # text reader rejects unnamed/numeric function arguments emitted by
+        # LLVM 15. instnamer makes the final textual IR round-trip through
+        # libNVVM without changing semantics.
         subprocess.run(
             [
                 str(toolchain.opt),
                 "-opaque-pointers=0",
                 f"-load-pass-plugin={toolchain.enzyme_plugin}",
-                # The cleanup passes remove now-dead Enzyme marker declarations
-                # and activity globals before libNVVM sees the module.
-                # libNVVM's LLVM 7 text reader rejects unnamed/numeric function
-                # arguments emitted by LLVM 15. instnamer makes the final
-                # textual IR round-trip through libNVVM without changing
-                # semantics.
                 "-passes=enzyme,adce,globaldce,instnamer",
                 "-S",
                 str(combined_path),
