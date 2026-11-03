@@ -1,68 +1,109 @@
 name: Tests
-# Runs the actual `numba_enzyme` test suite on every pull request.
-#
-# LLVM 15 is no longer served by apt.llvm.org for any *current*
-# Ubuntu/Debian codename (its supported window has moved on) --
-# so this job runs inside a plain debian:trixie container and reuses
-# the exact same pinned apt.llvm.org bookworm-15 channel that
-# packaging/Dockerfile.manylinux already uses successfully. The
-# Enzyme plugin itself is built at enzyme-build/ via
-# packaging/build_enzyme_plugin.sh, which is exactly where toolchain.py's
-# default resolution already looks -- matching how every dev box
-# is already set up, so no NUMBA_ENZYME_PLUGIN_PATH override is
-# needed here either.
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
+    branches:
+      - main
+  merge_group:
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
 
 jobs:
   detect-changes:
+    if: github.event_name == 'pull_request'
     uses: ./.github/workflows/detect-changes.yml
 
-  test:
-    name: Test
-    needs: detect-changes
-    if: needs.detect-changes.outputs.tests-relevant == 'true' || github.event_name == 'workflow_dispatch'
+  lint:
+    name: Pre-commit
+    needs: [detect-changes]
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' ||
+       needs.detect-changes.outputs.tests-relevant == 'true')
     runs-on: ubuntu-latest
-    container: debian:trixie
     steps:
-      - name: Install git
-        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Run pre-commit
+        run: uv run pre-commit run --all-files
+
+  test:
+    name: Test - ${{ matrix.os }} - Python ${{ matrix.python }}
+    needs: [detect-changes]
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' ||
+       needs.detect-changes.outputs.tests-relevant == 'true')
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ (contains(matrix.os, 'linux') && 'ghcr.io/enzymead/reactant-docker-images_22.04@sha256:3a4edb524a77b28cffdb9589fa23d0e4a43fec7da85f531e92ff6803fd62106f') || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - linux-x86-n4-32
+          - linux-arm64-c4a-32
+          - macOS-latest
+        python:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+          - "3.15"
+    timeout-minutes: 180
+    env:
+      HERMETIC_PYTHON_VERSION: ${{ matrix.python }}
+    steps:
+      - name: Set BAZEL_FLAGS
+        shell: bash
+        run: |
+          set -euo pipefail
+          BAZEL_FLAGS=""
+          if [ "${{ runner.arch }}" = "ARM64" ] && [ "${{ runner.os }}" = "Linux" ]; then
+            BAZEL_FLAGS="${BAZEL_FLAGS} --linkopt=-fuse-ld=lld"
+          fi
+          if command -v clang >/dev/null 2>&1; then
+            BAZEL_FLAGS="${BAZEL_FLAGS} --repo_env=CC=$(command -v clang)"
+          fi
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            if [ "${{ github.event_name }}" != "pull_request" ] || [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+              BAZEL_FLAGS="${BAZEL_FLAGS} --config=public_cache_push"
+            else
+              BAZEL_FLAGS="${BAZEL_FLAGS} --config=public_cache"
+            fi
+          fi
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            BAZEL_FLAGS="${BAZEL_FLAGS} --cxxopt=-Wno-nullability-completeness --host_cxxopt=-Wno-nullability-completeness"
+          fi
+          echo "BAZEL_FLAGS=${BAZEL_FLAGS}" >> "${GITHUB_ENV}"
 
       - uses: actions/checkout@v4
 
-      - name: Mark workspace as a safe git directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Install LLVM 15 + build tools
-        run: |
-          apt-get update && apt-get install -y --no-install-recommends \
-              curl gnupg ca-certificates cmake build-essential
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
-              | gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-15 main" \
-              > /etc/apt/sources.list.d/llvm-15.list
-          apt-get update && apt-get install -y --no-install-recommends \
-              llvm-15-dev clang-15 lld-15
-          rm -rf /var/lib/apt/lists/*
-
-      - name: Cache Enzyme plugin build
-        uses: actions/cache@v4
-        id: enzyme-cache
+      - uses: bazel-contrib/setup-bazel@0.19.1
+        name: Set up Bazel
         with:
-          path: enzyme-build
-          key: enzyme-v0.0.289-llvm15-${{ runner.os }}
+          bazelisk-cache: true
+          disk-cache: ${{ runner.os == 'macOS' && format('test-{0}-{1}-{2}', github.workflow, matrix.os, matrix.python) || false }}
+          restore-keys: ${{ runner.os == 'macOS' && format('test-{0}-{1}-', github.workflow, matrix.os) || false }}
+          repository-cache: true
+          bazelisk-version: 1.x
 
-      - name: Build standalone Enzyme plugin
-        if: steps.enzyme-cache.outputs.cache-hit != 'true'
-        run: bash packaging/build_enzyme_plugin.sh enzyme-build
+      - name: Run Bazel test suite
+        run: |
+          bazel test $BAZEL_FLAGS \
+            --color=yes \
+            --test_output=errors \
+            --experimental_ui_max_stdouterr_bytes=-1 \
+            --test_verbose_timeout_warnings \
+            //tests:python_tests
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
-
-      - name: Run tests
-        run: uv run pytest -v
-
-      - name: Run pre-commit
-        run: uv run pre-commit run --all-files
+      - name: Build wheel
+        if: matrix.python == '3.11'
+        run: |
+          bazel build $BAZEL_FLAGS --color=yes //:wheel

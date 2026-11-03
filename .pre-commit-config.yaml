@@ -22,5 +22,6 @@ repos:
       - id: debug-statements
       - id: end-of-file-fixer
       - id: trailing-whitespace
+        exclude: '\.patch$'
       - id: check-added-large-files
         args: ['--maxkb=3072']

@@ -3,7 +3,7 @@ Lower a Python function to LLVM IR via Numba.
 
 Compiles a Python function to LLVM IR with Numba, using the function's
 own type annotations (:mod:`numba_enzyme.types` classes) to build the
-Numba signature.The recovered kernel's exact parameter types are validated
+Numba signature. The recovered kernel's exact parameter types are validated
 against Numba's known ABI shape for use by driver synthesis.
 
 See Also
@@ -17,7 +17,7 @@ Examples
 >>> def f(x: Float64) -> Float64:
 ...     return x * x
 >>> lower(f).arg_types  # doctest: +SKIP
-('double*', '{ i8*, i32, i8*, i8*, i32 }**', 'double')
+('ptr', 'ptr', 'double')
 """
 
 import inspect
@@ -31,8 +31,14 @@ import numba as nb
 
 _CFUNC_PREFIX = "cfunc."
 
-# Numba's execption data representation.
-_EXPECTED_EXCINFO_TYPE = "{ i8*, i32, i8*, i8*, i32 }**"
+llvm_binding.initialize_all_targets()
+llvm_binding.initialize_all_asmprinters()
+
+# LLVM >= 17 uses opaque pointers (`ptr`) exclusively.
+_OPAQUE_POINTERS = llvm_binding.llvm_version_info[0] >= 17
+
+# Numba's exception data representation.
+_EXPECTED_EXCINFO_TYPE = "ptr" if _OPAQUE_POINTERS else "{ i8*, i32, i8*, i8*, i32 }**"
 
 # LLVM textual (bare) type for each numba scalar type.
 # TODO: expand for other scalar types
@@ -44,11 +50,12 @@ _LLVM_SCALAR_TYPE = {
 }
 
 # Flattened array ABI of a Numba array on the LLVM IR level.
-# struct fields in order: meminfo (i8*), parent (i8*), nitems (i64),
-# itemsize (i64), data (<elem>*), shape[0..ndim-1] (i64 each),
+# struct fields in order: meminfo (ptr), parent (ptr), nitems (i64),
+# itemsize (i64), data (ptr), shape[0..ndim-1] (i64 each),
 # strides[0..ndim-1] (i64 each).
 # TODO: not universal for every arch. Revisit this later
-_ARRAY_HEADER_TYPES = ("i8*", "i8*", "i64", "i64")
+_PTR_STR = "ptr" if _OPAQUE_POINTERS else "i8*"
+_ARRAY_HEADER_TYPES = (_PTR_STR, _PTR_STR, "i64", "i64")
 
 # Matches a call to any Numba NRT (memory-management runtime) function,
 # e.g. NRT_incref, NRT_MemInfo_alloc.
@@ -72,8 +79,6 @@ _NRT_SUPPORTED_CALLS = frozenset({"NRT_incref", "NRT_decref", "NRT_MemInfo_call_
 _NRT_DTOR_DECLARE_RE = re.compile(
     r"^(declare\s+void\s+@NRT_MemInfo_call_dtor\([^)]*\))(.*)$", re.MULTILINE
 )
-
-llvm_binding.initialize()
 
 
 class LoweringError(RuntimeError):
@@ -180,6 +185,8 @@ class LoweredKernel:
     arg_specs : tuple[ArgSpec, ...]
         One `ArgSpec` per logical argument, in declaration order,
         describing how each argument's fields map into `arg_types`.
+    ret_llvm_type : str
+        The scalar LLVM type of the kernel's return value (e.g. `"double"`).
 
     See Also
     --------
@@ -200,6 +207,7 @@ class LoweredKernel:
     n_args: int
     arg_types: tuple[str, ...]
     arg_specs: tuple[ArgSpec, ...]
+    ret_llvm_type: str = "double"
 
 
 def _numba_type_of(annotation) -> nb.types.Type:
@@ -269,6 +277,24 @@ def _llvm_scalar_type(numba_type: nb.types.Type) -> str:
             f"unsupported scalar type {numba_type!r}; supported: "
             f"{sorted(str(t) for t in _LLVM_SCALAR_TYPE)}"
         ) from None
+
+
+def _llvm_ptr_type(pointee_llvm_type: str) -> str:
+    """
+    Format an LLVM pointer type for the active LLVM version.
+
+    Parameters
+    ----------
+    pointee_llvm_type : str
+        Pointee LLVM textual type (e.g. `"double"`), used only when running
+        against pre-LLVM-17 typed pointers.
+
+    Returns
+    -------
+    str
+        `"ptr"` under opaque pointers, or `f"{pointee_llvm_type}*"` otherwise.
+    """
+    return "ptr" if _OPAQUE_POINTERS else f"{pointee_llvm_type}*"
 
 
 def _validate_nrt_calls(ir_text: str) -> None:
@@ -395,7 +421,7 @@ def lower(func: Callable) -> LoweredKernel:
     >>> def f(x: Float64) -> Float64:
     ...     return x * x
     >>> lower(f).arg_types  # doctest: +SKIP
-    ('double*', '{ i8*, i32, i8*, i8*, i32 }**', 'double')
+    ('ptr', 'ptr', 'double')
     """
     hints = typing.get_type_hints(func)
     params = inspect.signature(func).parameters
@@ -417,7 +443,6 @@ def lower(func: Callable) -> LoweredKernel:
         raise LoweringError(
             f"expected native_name to start with {_CFUNC_PREFIX!r}, got {native_name!r}"
         )
-    # TODO: maybe better to use `replace(_CFUNC_PREFIX, "")`
     entry_symbol = native_name[len(_CFUNC_PREFIX) :]
 
     mod = llvm_binding.parse_assembly(ir_text)
@@ -441,7 +466,8 @@ def lower(func: Callable) -> LoweredKernel:
 
     retptr, excinfo, *flat_args = args
 
-    expected_retptr_type = _llvm_scalar_type(ret_numba_type) + "*"
+    ret_llvm_type = _llvm_scalar_type(ret_numba_type)
+    expected_retptr_type = _llvm_ptr_type(ret_llvm_type)
     if retptr.name != "retptr" or str(retptr.type) != expected_retptr_type:
         raise LoweringError(
             f"expected first parameter 'retptr: {expected_retptr_type}', "
@@ -461,7 +487,7 @@ def lower(func: Callable) -> LoweredKernel:
             elem_llvm_type = _llvm_scalar_type(numba_type.dtype)
             expected_fields = (
                 *_ARRAY_HEADER_TYPES,
-                elem_llvm_type + "*",
+                _llvm_ptr_type(elem_llvm_type),
                 *("i64",) * ndim,  # this is valid only for 64bit?
                 *("i64",) * ndim,  # this is valid only for 64bit?
             )
@@ -487,8 +513,7 @@ def lower(func: Callable) -> LoweredKernel:
             arg_specs.append(ArgSpec(kind="scalar", llvm_type=expected))
 
     # Only check NRT calls in the entry function.
-    # The rest of the IR will be stripped out via
-    # `llvm-extract`.
+    # The rest of the IR will be stripped out during extraction.
     _validate_nrt_calls(str(fn))
     ir_text = _annotate_nrt_dtor(ir_text)
     try:
@@ -505,4 +530,5 @@ def lower(func: Callable) -> LoweredKernel:
         n_args=n_args,
         arg_types=arg_types,
         arg_specs=tuple(arg_specs),
+        ret_llvm_type=ret_llvm_type,
     )

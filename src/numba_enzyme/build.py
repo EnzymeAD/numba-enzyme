@@ -1,9 +1,9 @@
 """
-Handles the pipeline from lowering the function to building the shared object.
+Handles the pipeline from lowering the function to building the native object.
 
-Wires lowering, driver synthesis, `llvm-link`, the Enzyme `opt`
-pass, and the final shared object compilation into a single call, and
-caches the built `.so` files on disk.
+Wires lowering, driver synthesis, in-process LLVM IR extraction/linking and
+Enzyme differentiation via `libNumbaEnzyme`, and `llvmlite.binding` native
+object emission into a single call, caching the built object files on disk.
 
 See Also
 --------
@@ -20,15 +20,19 @@ Examples
 1
 """
 
+import ctypes
 import hashlib
 import inspect
 import json
 import os
-import re
-import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+
+import llvmlite
+import llvmlite.binding as llvm_binding
+import numba as nb
 
 from numba_enzyme.driver import synthesise
 from numba_enzyme.lowering import ArgSpec, lower
@@ -41,20 +45,22 @@ _DEFAULT_CACHE_DIR = Path.home() / ".cache" / "numba_enzyme"
 @dataclass(frozen=True)
 class BuiltKernel:
     """
-    A compiled, cacheable shared object exposing grad/JVP entry points.
+    A compiled, cacheable native object file exposing grad/JVP entry points.
 
     Attributes
     ----------
     path : pathlib.Path
-        Path to the built `.so` file.
+        Path to the built native object file (`kernel.o`).
     grad_symbol : str
         Name of the reverse-mode entry point exported by `path`.
     jvp_symbol : str
         Name of the forward-mode entry point exported by `path`.
     n_args : int
-        Number of scalar arguments the original function takes.
+        Number of logical arguments the original function takes.
+    arg_specs : tuple[ArgSpec, ...]
+        ABI specification for each logical argument.
     from_cache : bool
-        Whether the shared object was loaded from the disk.
+        Whether the object file was loaded from the disk cache.
 
     See Also
     --------
@@ -80,7 +86,7 @@ class BuiltKernel:
 
 def _cache_dir() -> Path:
     """
-    Path in which the cached shared-objects are stored.
+    Path in which the cached compiled kernels are stored.
 
     Defaults to `~/.cache/numba_enzyme`, overridable via the
     `NUMBA_ENZYME_CACHE_DIR` environment variable.
@@ -102,34 +108,36 @@ def _cache_dir() -> Path:
 
 def _toolchain_fingerprint() -> str:
     """
-    Fingerprint the resolved toolchain by each tool's mtime and size.
+    Fingerprint `libNumbaEnzyme`, `llvmlite`, `numba`, and the host target.
 
-    Used as part of the cache key. Rebuilding any part of the toolchain
-    invalidates every cache entry.
+    Used as part of the cache key. Rebuilding `libNumbaEnzyme` or upgrading
+    `numba`/`llvmlite` invalidates cached entries.
 
     Returns
     -------
     str
-        A string encoding each tool's path, modification time, and
-        size.
+        A string encoding `libNumbaEnzyme`'s path, mtime, and size together
+        with the active `llvmlite`, `numba`, and target triple metadata.
 
     See Also
     --------
-    numba_enzyme.toolchain.get_toolchain : Resolves the tools fingerprinted
-        here.
+    numba_enzyme.toolchain.get_toolchain : Resolves `libNumbaEnzyme`.
 
     Examples
     --------
     >>> from numba_enzyme.build import _toolchain_fingerprint
     >>> _toolchain_fingerprint()  # doctest: +SKIP
-    '/usr/bin/clang-15:...|/usr/bin/llvm-link-15:...'
+    '.../libNumbaEnzyme.so:...|llvmlite=0.50.0|numba=0.68.1|...'
     """
     tc = get_toolchain()
-    parts = []
-    for path in (tc.clang, tc.llvm_link, tc.opt, tc.llvm_extract, tc.enzyme_plugin):
-        stat = path.stat()
-        parts.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
-    return "|".join(parts)
+    stat = tc.enzyme_lib.stat()
+    return (
+        f"{tc.enzyme_lib}:{stat.st_mtime_ns}:{stat.st_size}"
+        f"|llvmlite={llvmlite.__version__}"
+        f"|numba={nb.__version__}"
+        f"|triple={llvm_binding.get_process_triple()}"
+        f"|cpu={llvm_binding.get_host_cpu_name()}"
+    )
 
 
 def _cache_key(func: Callable) -> str:
@@ -160,60 +168,195 @@ def _cache_key(func: Callable) -> str:
     return hashlib.sha256(digest_input.encode()).hexdigest()
 
 
-_LIBC_MAP_RE = re.compile(r"(/\S*/lib(c|m)\.so(?:\.\d+)*)$")
-
-
-def _locate_runtime_libs() -> list[Path]:
+def create_target_machine() -> llvm_binding.TargetMachine:
     """
-    Find the running process's own loaded libc/libm, via ``/proc/self/maps``.
+    Create an `llvmlite` `TargetMachine` matching Numba's CPU JIT settings.
 
-    Used only for the vendored-crt link path (see `build`): a vendored
-    toolchain ships its own crt startup objects and a static `libgcc`,
-    but deliberately does not vendor libc/libm themselves. Every Linux
-    target that can run this Python process at all has *already*
-    loaded some libc into it by the time this runs, so reading its own
-    memory map back is a distro/layout-agnostic way to find the exact
-    file to link against -- unlike hardcoding a path convention such
-    as Debian's ``/lib/x86_64-linux-gnu/``, which doesn't exist on e.g.
-    Fedora/RHEL/Arch. For instance a link built this way on
-    Debian trixie produces a shared object whose only `NEEDED` entries
-    are ``libc.so.6``/``libm.so.6``.
+    Uses `codemodel="jitdefault"` and `jit=True` across Linux (`x86_64`,
+    `aarch64`) and macOS (`arm64`, `x86_64`) so MCJIT relocations against
+    in-process runtime helpers (`libm`, `NRT_*`) succeed regardless of
+    virtual-address distance.
 
     Returns
     -------
-    list of pathlib.Path
-        Absolute paths to the loaded libc and (if present as a
-        separate mapping as recent glibc merges it into libc) libm.
+    llvmlite.binding.TargetMachine
+        Configured host `TargetMachine` for MCJIT object emission and loading.
 
     See Also
     --------
-    build : Used when a vendored crt directory exists.
+    build : Uses this `TargetMachine` to emit `kernel.o`.
+    numba_enzyme.runtime.load : Uses this `TargetMachine` to construct MCJIT.
 
     Examples
     --------
-    >>> from numba_enzyme.build import _locate_runtime_libs
-    >>> any(p.name.startswith("libc.so") for p in _locate_runtime_libs())
+    >>> from numba_enzyme.build import create_target_machine
+    >>> bool(create_target_machine().triple)
     True
     """
-    found: dict[str, Path] = {}
-    with open("/proc/self/maps") as f:
-        for line in f:
-            match = _LIBC_MAP_RE.search(line)
-            if match:
-                found.setdefault(match.group(2), Path(match.group(1)))
-    return list(found.values())
+    llvm_binding.initialize_all_targets()
+    llvm_binding.initialize_all_asmprinters()
+
+    triple = llvm_binding.get_process_triple()
+    target = llvm_binding.Target.from_triple(triple)
+    arch = triple.split("-", 1)[0]
+    if arch.startswith("x86"):
+        reloc = "static"
+    elif arch.startswith("ppc"):
+        reloc = "pic"
+    else:
+        reloc = "default"
+
+    try:
+        features = llvm_binding.get_host_cpu_features().flatten()
+    except RuntimeError:
+        # `get_host_cpu_features()` raises RuntimeError on Apple Silicon;
+        # `get_host_cpu_name()` (e.g. "apple-m1") already encodes the ISA.
+        features = ""
+
+    return target.create_target_machine(
+        cpu=llvm_binding.get_host_cpu_name(),
+        features=features,
+        opt=2,
+        reloc=reloc,
+        codemodel="jitdefault",
+        jit=True,
+    )
+
+
+@lru_cache(maxsize=4)
+def _load_enzyme_ffi(lib_path: Path) -> ctypes.CDLL:
+    """
+    Load `libNumbaEnzyme` via `ctypes` and configure its C ABI prototypes.
+
+    Parameters
+    ----------
+    lib_path : pathlib.Path
+        Resolved path to `libNumbaEnzyme`.
+
+    Returns
+    -------
+    ctypes.CDLL
+        Loaded library handle with `numba_enzyme_compile_ir` and
+        `numba_enzyme_free_string` prototypes configured.
+    """
+    lib = ctypes.CDLL(str(lib_path))
+    lib.numba_enzyme_compile_ir.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.numba_enzyme_compile_ir.restype = ctypes.c_int
+    lib.numba_enzyme_free_string.argtypes = [ctypes.c_void_p]
+    lib.numba_enzyme_free_string.restype = None
+    return lib
+
+
+def _run_enzyme_pass(
+    lib_path: Path, kernel_ir: str, entry_symbol: str, driver_ir: str
+) -> tuple[str, str]:
+    """
+    Extract, link, and differentiate a kernel in-process via `libNumbaEnzyme`.
+
+    Parameters
+    ----------
+    lib_path : pathlib.Path
+        Path to `libNumbaEnzyme`.
+    kernel_ir : str
+        Full LLVM IR module emitted by Numba.
+    entry_symbol : str
+        Mangled kernel symbol to extract and differentiate.
+    driver_ir : str
+        Synthesised Enzyme driver LLVM IR module.
+
+    Returns
+    -------
+    combined_ir : str
+        Post-extraction, post-link LLVM IR before Enzyme runs.
+    enzyme_ir : str
+        Differentiated LLVM IR produced by Enzyme.
+
+    Raises
+    ------
+    RuntimeError
+        If extraction, module linking, Enzyme differentiation, or LLVM IR
+        verification fails.
+    """
+    ffi = _load_enzyme_ffi(lib_path)
+    combined_ptr = ctypes.c_void_p()
+    enzyme_ptr = ctypes.c_void_p()
+    err_ptr = ctypes.c_void_p()
+    try:
+        rc = ffi.numba_enzyme_compile_ir(
+            kernel_ir.encode("utf-8"),
+            entry_symbol.encode("utf-8"),
+            driver_ir.encode("utf-8"),
+            ctypes.byref(combined_ptr),
+            ctypes.byref(enzyme_ptr),
+            ctypes.byref(err_ptr),
+        )
+        if rc != 0:
+            err_msg = (
+                ctypes.string_at(err_ptr.value).decode("utf-8", errors="replace")
+                if err_ptr.value
+                else "unknown Enzyme compilation failure"
+            )
+            raise RuntimeError(f"Enzyme compilation failed: {err_msg}")
+        combined_ir = (
+            ctypes.string_at(combined_ptr.value).decode("utf-8")
+            if combined_ptr.value
+            else ""
+        )
+        enzyme_ir = ctypes.string_at(enzyme_ptr.value).decode("utf-8")
+        return combined_ir, enzyme_ir
+    finally:
+        if combined_ptr.value:
+            ffi.numba_enzyme_free_string(combined_ptr)
+        if enzyme_ptr.value:
+            ffi.numba_enzyme_free_string(enzyme_ptr)
+        if err_ptr.value:
+            ffi.numba_enzyme_free_string(err_ptr)
+
+
+def _compile_object(enzyme_ir: str) -> bytes:
+    """
+    Optimize differentiated LLVM IR at `-O2` and emit a native object file.
+
+    Parameters
+    ----------
+    enzyme_ir : str
+        Differentiated LLVM IR text produced by Enzyme.
+
+    Returns
+    -------
+    bytes
+        Relocatable native object bytes ready for `llvmlite` MCJIT loading.
+    """
+    tm = create_target_machine()
+    mod = llvm_binding.parse_assembly(enzyme_ir)
+    mod.triple = tm.triple
+    mod.verify()
+
+    pto = llvm_binding.create_pipeline_tuning_options(speed_level=2)
+    pb = llvm_binding.create_pass_builder(tm, pto)
+    mpm = pb.getModulePassManager()
+    mpm.run(mod, pb)
+
+    return tm.emit_object(mod)
 
 
 def build(func: Callable) -> BuiltKernel:
     """
-    Build, or fetch from cache, the shared object for a function.
+    Build, or fetch from cache, the differentiated native object for `func`.
 
-    Lowers `func` with Numba, synthesises its Enzyme driver, links the
-    two with `llvm-link`, runs the standalone Enzyme `opt` pass, and
-    compiles the result to a shared object with `clang`. If an
-    identical build (same source text and toolchain fingerprint) is
-    already cached on disk, the cached one is returned without any
-    subprocess calls.
+    Lowers `func` with Numba, synthesises its Enzyme driver, extracts and
+    differentiates the linked IR in-process via `libNumbaEnzyme`, optimizes
+    and emits a native relocatable object via `llvmlite`, and caches the
+    result on disk. If an identical build (same source text and toolchain
+    fingerprint) is already cached on disk, the cached object is returned
+    directly without recompiling.
 
     Parameters
     ----------
@@ -224,8 +367,7 @@ def build(func: Callable) -> BuiltKernel:
     Returns
     -------
     BuiltKernel
-        The compiled (or cached) shared object and its entry-point
-        names.
+        The compiled (or cached) native object and its entry-point names.
 
     See Also
     --------
@@ -239,21 +381,17 @@ def build(func: Callable) -> BuiltKernel:
     >>> def f(x: Float64) -> Float64:
     ...     return x * x
     >>> build(f).path.suffix  # doctest: +SKIP
-    '.so'
+    '.o'
     """
     entry_dir = _cache_dir() / _cache_key(func)
-    so_path = entry_dir / "kernel.so"
+    obj_path = entry_dir / "kernel.o"
     meta_path = entry_dir / "meta.json"
 
-    if so_path.is_file() and meta_path.is_file():
-        # if the statement is true, lower() isn't called again here. The
-        # reason is that Numba embeds an internal version counter in the
-        # mangled symbol name that increments every time nb.cfunc compiles
-        # the same function again in the same process (e.g. ...B2v1...
-        # vs ...B2v2...), even with identical source. Recomputing symbol
-        # names on a cache hit would silently drift from what's actually
-        # embedded into the already-built .so. Persist them from the
-        # original build instead.
+    if obj_path.is_file() and meta_path.is_file():
+        # Lowering is skipped on cache hits because Numba embeds an internal
+        # per-qualname version counter in mangled symbol names that increments
+        # on repeated `nb.cfunc` compilations in the same process. Persisting
+        # the symbol names in `meta.json` keeps them aligned with `kernel.o`.
         raw_meta = json.loads(meta_path.read_text())
         try:
             meta = {
@@ -263,118 +401,24 @@ def build(func: Callable) -> BuiltKernel:
                 "arg_specs": tuple(ArgSpec(**spec) for spec in raw_meta["arg_specs"]),
             }
         except (KeyError, TypeError):
-            # meta.json doesn't match the schema this version of build()
-            # expects, in this case it rebuilds the meta.json. Any shape
-            # mismatc will fall under this branch as a missing/unexpected
-            # key and is treated the same way.
             pass
         else:
-            return BuiltKernel(path=so_path, from_cache=True, **meta)
+            return BuiltKernel(path=obj_path, from_cache=True, **meta)
 
+    tc = get_toolchain()
     kernel = lower(func)
     drv = synthesise(kernel)
-    tc = get_toolchain()
+    combined_ir, enzyme_ir = _run_enzyme_pass(
+        tc.enzyme_lib, kernel.ir, kernel.entry_symbol, drv.ir
+    )
+    obj_bytes = _compile_object(enzyme_ir)
 
     entry_dir.mkdir(parents=True, exist_ok=True)
-    kernel_full_ll = entry_dir / "kernel_full.ll"
-    kernel_ll = entry_dir / "kernel.ll"
-    driver_ll = entry_dir / "driver.ll"
-    combined_ll = entry_dir / "combined.ll"
-    enzyme_out_ll = entry_dir / "enzyme_out.ll"
-
-    # extract the entry function and discard
-    # the irrelevant part of the IR.
-    kernel_full_ll.write_text(kernel.ir)
-    subprocess.run(
-        [
-            str(tc.llvm_extract),
-            f"--func={kernel.entry_symbol}",
-            "--recursive",
-            "--keep-const-init",
-            str(kernel_full_ll),
-            "-S",
-            "-o",
-            str(kernel_ll),
-        ],
-        check=True,
-    )
-    driver_ll.write_text(drv.ir)
-
-    subprocess.run(
-        [
-            str(tc.llvm_link),
-            str(kernel_ll),
-            str(driver_ll),
-            "-S",
-            "-o",
-            str(combined_ll),
-        ],
-        check=True,
-    )
-    subprocess.run(
-        [
-            str(tc.opt),
-            f"-load-pass-plugin={tc.enzyme_plugin}",
-            "-passes=enzyme",
-            "-S",
-            str(combined_ll),
-            "-o",
-            str(enzyme_out_ll),
-        ],
-        check=True,
-    )
-    # `clang -shared` shells out to a separate linker executable for the
-    # final link step. A vendored toolchain (see toolchain.py) ships its
-    # own `ld.lld` right next to clang specifically so this works with no
-    # system linker present at all. The system/dev-mode toolchain doesn't
-    # need this, a normal dev machine already has a system `ld`. So only
-    # pass it when the vendored linker actually exists next to clang.
-    vendored_lld = tc.clang.parent / "ld.lld"
-    extra_link_args = [f"-fuse-ld={vendored_lld}"] if vendored_lld.is_file() else []
-
-    # Even with a linker present, `-shared` needs C runtime startup
-    # objects (crti.o/crtn.o/crtbeginS.o/crtendS.o) and libgcc, normally
-    # supplied by a system C toolchain (gcc/libc6-dev). A vendored
-    # toolchain ships these too (see cibw_before_all.sh); `-nostdlib`
-    # stops clang from also trying to supply its own defaults (which
-    # would look in system paths that don't exist here) so every input
-    # is explicit. libc/libm are deliberately NOT vendored -- they're
-    # located on the actual target machine instead (`_locate_runtime_libs`),
-    # since baking in one distro's copy or path convention would break
-    # on any other. Dev-mode/system toolchain untouched: this whole
-    # block only runs when `_vendor/crt/` actually exists.
-    vendored_crt_dir = tc.clang.parent.parent / "crt"
-    post_input_args = []
-    if vendored_crt_dir.is_dir():
-        extra_link_args.append("-nostdlib")
-        post_input_args = [
-            "-x",
-            "none",
-            str(vendored_crt_dir / "crti.o"),
-            str(vendored_crt_dir / "crtbeginS.o"),
-            str(vendored_crt_dir / "libgcc.a"),
-            *[str(p) for p in _locate_runtime_libs()],
-            str(vendored_crt_dir / "crtendS.o"),
-            str(vendored_crt_dir / "crtn.o"),
-        ]
-
-    # TODO: consider `-O3` at some point
-    subprocess.run(
-        [
-            str(tc.clang),
-            "-O2",
-            "-fPIC",
-            "-shared",
-            *extra_link_args,
-            "-x",
-            "ir",
-            str(enzyme_out_ll),
-            *post_input_args,
-            "-o",
-            str(so_path),
-        ],
-        check=True,
-    )
+    (entry_dir / "kernel_full.ll").write_text(kernel.ir)
+    (entry_dir / "driver.ll").write_text(drv.ir)
+    (entry_dir / "combined.ll").write_text(combined_ir)
+    (entry_dir / "enzyme_out.ll").write_text(enzyme_ir)
+    obj_path.write_bytes(obj_bytes)
 
     meta = {
         "grad_symbol": drv.grad_symbol,
@@ -384,4 +428,4 @@ def build(func: Callable) -> BuiltKernel:
     }
     meta_path.write_text(json.dumps(meta, default=vars))
 
-    return BuiltKernel(path=so_path, from_cache=False, **meta)
+    return BuiltKernel(path=obj_path, from_cache=False, **meta)

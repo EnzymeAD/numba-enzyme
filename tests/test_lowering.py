@@ -1,5 +1,6 @@
 import inspect
 import math
+import re
 
 import numpy as np
 import pytest
@@ -26,11 +27,14 @@ def test_lower_finds_valid_entry_point(func):
     result = lower(func)
     assert isinstance(result, LoweredKernel)
     assert result.n_args == n_args
+    assert result.ret_llvm_type == "double"
     assert len(result.arg_types) == n_args + 2
-    assert result.arg_types[0] == "double*"
-    assert result.arg_types[1] == "{ i8*, i32, i8*, i8*, i32 }**"
+    assert result.arg_types[0] == "ptr"
+    assert result.arg_types[1] == "ptr"
     assert result.arg_types[2:] == ("double",) * n_args
-    assert f"define i32 @{result.entry_symbol}(" in result.ir
+    assert re.search(
+        rf"define\b[^\n]*\bi32 @{re.escape(result.entry_symbol)}\(", result.ir
+    )
 
 
 def f_mixed(x: Float64, n: Int32) -> Float64:
@@ -41,8 +45,8 @@ def test_lower_supports_mixed_scalar_types():
     result = lower(f_mixed)
     assert result.n_args == 2
     assert result.arg_types == (
-        "double*",
-        "{ i8*, i32, i8*, i8*, i32 }**",
+        "ptr",
+        "ptr",
         "double",
         "i32",
     )
@@ -62,13 +66,13 @@ def test_lower_supports_array_argument():
     # retptr, excinfo, then the flattened array-struct fields: meminfo,
     # parent, nitems, itemsize, data, shape[0], strides[0] (5 + 2*1 = 7).
     assert result.arg_types == (
-        "double*",
-        "{ i8*, i32, i8*, i8*, i32 }**",
-        "i8*",
-        "i8*",
+        "ptr",
+        "ptr",
+        "ptr",
+        "ptr",
         "i64",
         "i64",
-        "double*",
+        "ptr",
         "i64",
         "i64",
     )
@@ -86,13 +90,13 @@ def test_lower_supports_array_argument_ndim2():
     result = lower(f_array_2d)
     assert result.arg_specs == (ArgSpec(kind="array", ndim=2, elem_llvm_type="double"),)
     assert result.arg_types == (
-        "double*",
-        "{ i8*, i32, i8*, i8*, i32 }**",
-        "i8*",
-        "i8*",
+        "ptr",
+        "ptr",
+        "ptr",
+        "ptr",
         "i64",
         "i64",
-        "double*",
+        "ptr",
         "i64",
         "i64",
         "i64",
@@ -115,14 +119,14 @@ def test_lower_supports_mixed_scalar_and_array_arguments():
         ArgSpec(kind="array", ndim=1, elem_llvm_type="double"),
     )
     assert result.arg_types == (
-        "double*",
-        "{ i8*, i32, i8*, i8*, i32 }**",
+        "ptr",
+        "ptr",
         "double",
-        "i8*",
-        "i8*",
+        "ptr",
+        "ptr",
         "i64",
         "i64",
-        "double*",
+        "ptr",
         "i64",
         "i64",
     )

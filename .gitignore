@@ -1,18 +1,22 @@
 .venv/
 __pycache__/
 *.pyc
+/bazel-*
+compile_commands.json
+dist/
+wheelhouse/
 enzyme-src/
 enzyme-build/
 *.so
+*.dylib
+*.o
 *.ll
 .pytest_cache/
 .ruff_cache/
 bk/
 
-# _vendor/ is populated at wheel-build time (see packaging/), never
-# committed as a matter of course -- but a blanket `*.so` above would
-# also make sdist-based build frontends silently drop the Enzyme
-# plugin from the wheel if it's ever present there. Un-ignore
-# explicitly rather than relying on which build frontend gets used.
+# _vendor/ may be populated at local wheel-build time, never committed as
+# a matter of course -- un-ignore explicitly so `*.so`/`*.dylib` above do
+# not cause sdist/wheel frontends to drop `libNumbaEnzyme` when present.
 !src/numba_enzyme/_vendor/
 !src/numba_enzyme/_vendor/**

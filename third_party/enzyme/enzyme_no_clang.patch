@@ -1,0 +1,53 @@
+diff --git a/BUILD b/BUILD
+--- a/BUILD
++++ b/BUILD
+@@ -284,7 +284,6 @@
+         [
+             "Enzyme/*.cpp",
+             "Enzyme/TypeAnalysis/*.cpp",
+-            "Enzyme/Clang/EnzymeClang.cpp",
+         ],
+         exclude = [
+             "Enzyme/eopt.cpp",
+@@ -312,7 +311,7 @@
+             "Enzyme/TypeAnalysis/*.h",
+         ],
+         exclude = ["Enzyme/AdjointGenerator.h"],
+-    ) + ["Enzyme/Clang/bundled_includes.h"],
++    ),
+     copts = [
+         "-DENZYME_RUNPASS=1",
+         "-DENZYME_VERSION_MAJOR=0",
+@@ -321,24 +320,11 @@
+         "-Wno-unused-variable",
+         "-Wno-return-type",
+     ],
+-    data = ["@llvm-project//clang:builtin_headers_gen"],
+-    includes = [
+-        "Enzyme/Clang",  # for bundled_includes.h
+-    ],
+     visibility = ["//visibility:public"],
+     deps = [
+         ":EnzymeCacheUtility",
+         ":EnzymeDiffCore",
+         ":EnzymeTypeAnalysis",
+-        ":bundled-includes",
+-        "@llvm-project//clang:ast",
+-        "@llvm-project//clang:basic",
+-        "@llvm-project//clang:driver",
+-        "@llvm-project//clang:frontend",
+-        "@llvm-project//clang:frontend_tool",
+-        "@llvm-project//clang:lex",
+-        "@llvm-project//clang:sema",
+-        "@llvm-project//clang:serialization",
+         "@llvm-project//llvm:AggressiveInstCombine",
+         "@llvm-project//llvm:Analysis",
+         "@llvm-project//llvm:CodeGen",
+@@ -356,7 +342,6 @@
+         "@llvm-project//llvm:TransformUtils",
+         "@llvm-project//llvm:config",
+     ],
+-    alwayslink = 1,
+ )
+ 
+ # Modified from llvm_driver_cc_binary since that can't be used

@@ -93,19 +93,19 @@ def test_synthesise_array_grad_signature():
     """
     drv = synthesise(lower(farr))
     signature = (
-        f'define void @"{drv.grad_symbol}"(double* %"x0_data", '
-        'double* %"x0_ddata", i64 %"x0_nitems", i64 %"x0_itemsize", '
-        'i64 %"x0_shape0", i64 %"x0_strides0")'
+        f"define void @{drv.grad_symbol}(ptr %x0_data, "
+        "ptr %x0_ddata, i64 %x0_nitems, i64 %x0_itemsize, "
+        "i64 %x0_shape0, i64 %x0_strides0)"
     )
     assert signature in drv.ir
     grad_start = drv.ir.index(signature)
     grad_body = drv.ir[grad_start : drv.ir.index("\n}\n", grad_start)]
-    assert 'call void (i8*, ...) @"__enzyme_autodiff"' in grad_body
+    assert "call void (ptr, ...) @__enzyme_autodiff" in grad_body
     # 2 enzyme_dup markers (retptr's cotangent seed, and the array's
     # data/d_data pair) + 7 enzyme_const markers (excinfo, meminfo,
     # parent, nitems, itemsize, shape, strides).
-    assert grad_body.count('@"enzyme_dup"') == 2
-    assert grad_body.count('@"enzyme_const"') == 7
+    assert grad_body.count("@enzyme_dup") == 2
+    assert grad_body.count("@enzyme_const") == 7
 
 
 def test_grad_and_jvp_match_analytic_for_array_argument():
