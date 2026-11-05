@@ -1,8 +1,9 @@
 """
-Load a built shared object and expose it as plain Python callables.
+Load a built kernel object and expose it as plain Python callables.
 
-Wraps a `numba_enzyme.build.BuiltKernel`'s `grad_<entry>``/
-`jvp_<entry>` symbols with :mod:`ctypes`.
+Loads a `numba_enzyme.build.BuiltKernel` into an `llvmlite` MCJIT execution
+engine (with Numba's runtime C helpers registered in-process) and wraps its
+`grad_<entry>` and `jvp_<entry>` symbols with :mod:`ctypes`.
 `grad_<entry>` is void and writes through an explicit output pointer
 uniformly for every arity. `jvp_<entry>` always returns a bare `float`
 regardless of arity.
@@ -26,10 +27,14 @@ Examples
 import ctypes
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 
+import llvmlite.binding as llvm_binding
 import numpy as np
+from numba.core.registry import cpu_target
+from numba.core.runtime import rtsys
 
-from numba_enzyme.build import BuiltKernel
+from numba_enzyme.build import BuiltKernel, create_target_machine
 from numba_enzyme.lowering import ArgSpec
 
 # Maps an ArgSpec.elem_llvm_type string to its ctypes equivalent, for
@@ -41,6 +46,20 @@ _ELEM_CTYPE = {
     "i32": ctypes.c_int32,
     "i64": ctypes.c_int64,
 }
+
+
+@lru_cache(maxsize=1)
+def _ensure_numba_runtime_symbols() -> None:
+    """
+    Register Numba's C runtime and NRT helpers into `llvmlite.binding`.
+
+    Required when loading a cached `kernel.o` in a fresh Python process
+    where `numba.cfunc` has not yet initialized `cpu_target.target_context`
+    or `NRT_MemInfo_call_dtor`.
+    """
+    llvm_binding.initialize_all_targets()
+    llvm_binding.initialize_all_asmprinters()
+    rtsys.initialize(cpu_target.target_context)
 
 
 def _array_ctypes_argtypes(spec: ArgSpec) -> list:
@@ -128,7 +147,7 @@ class Differentiable:
         tangent values, and returns a single `float`; raises
         `TypeError` if either tuple has the wrong length.
     n_args : int
-        Number of scalar arguments the underlying function takes.
+        Number of logical arguments the underlying function takes.
 
     See Also
     --------
@@ -152,17 +171,22 @@ class Differentiable:
 
 def load(built: BuiltKernel) -> Differentiable:
     """
-    Load a built kernel via ctypes and wrap it as plain Python callables.
+    Load a built kernel via MCJIT and wrap it as plain Python callables.
 
     Parameters
     ----------
     built : numba_enzyme.build.BuiltKernel
-        The compiled shared object to load.
+        The compiled native object file to load.
 
     Returns
     -------
     Differentiable
         Plain Python callables wrapping `built`'s grad/JVP symbols.
+
+    Raises
+    ------
+    RuntimeError
+        If the compiled object lacks either expected entry-point symbol.
 
     See Also
     --------
@@ -180,7 +204,16 @@ def load(built: BuiltKernel) -> Differentiable:
     >>> load(build(f)).grad(2.0)  # doctest: +SKIP
     (4.0,)
     """
-    lib = ctypes.CDLL(str(built.path))
+    _ensure_numba_runtime_symbols()
+
+    obj_bytes = built.path.read_bytes()
+    tm = create_target_machine()
+    backing_mod = llvm_binding.parse_assembly(f'target triple = "{tm.triple}"\n')
+    ee = llvm_binding.create_mcjit_compiler(backing_mod, tm)
+    ee.set_object_cache(getbuffer_func=lambda _mod: obj_bytes)
+    ee.finalize_object()
+    ee.run_static_constructors()
+
     n = built.n_args
     arg_specs = built.arg_specs
     n_scalar = sum(1 for spec in arg_specs if spec.kind == "scalar")
@@ -195,13 +228,15 @@ def load(built: BuiltKernel) -> Differentiable:
             grad_argtypes += _array_ctypes_argtypes(spec)
             jvp_argtypes += _array_ctypes_argtypes(spec)
 
-    grad_fn = getattr(lib, built.grad_symbol)
-    grad_fn.restype = None
-    grad_fn.argtypes = grad_argtypes
+    grad_addr = ee.get_function_address(built.grad_symbol)
+    if not grad_addr:
+        raise RuntimeError(f"JIT object missing symbol {built.grad_symbol!r}")
+    jvp_addr = ee.get_function_address(built.jvp_symbol)
+    if not jvp_addr:
+        raise RuntimeError(f"JIT object missing symbol {built.jvp_symbol!r}")
 
-    jvp_fn = getattr(lib, built.jvp_symbol)
-    jvp_fn.restype = ctypes.c_double
-    jvp_fn.argtypes = jvp_argtypes
+    grad_fn = ctypes.CFUNCTYPE(None, *grad_argtypes)(grad_addr)
+    jvp_fn = ctypes.CFUNCTYPE(ctypes.c_double, *jvp_argtypes)(jvp_addr)
 
     def grad(*xs) -> tuple:
         """
@@ -237,6 +272,7 @@ def load(built: BuiltKernel) -> Differentiable:
         >>> load(build(f)).grad(2.0)  # doctest: +SKIP
         (4.0,)
         """
+        _ = ee  # Retain MCJIT executable memory while `grad` is alive.
         if len(xs) != n:
             raise TypeError(f"expected {n} arguments, got {len(xs)}")
 
@@ -313,6 +349,7 @@ def load(built: BuiltKernel) -> Differentiable:
         >>> load(build(f)).jvp((2.0,), (1.0,))  # doctest: +SKIP
         4.0
         """
+        _ = ee  # Retain MCJIT executable memory while `jvp` is alive.
         if len(xs) != n or len(seed) != n:
             raise TypeError(f"expected {n} values for both xs and seed")
 

@@ -1,13 +1,15 @@
 """
-Tests for build.py: correctness of the built shared object, and cache
-behavior (hit/miss).
+Tests for build.py: correctness of the built native object, cache
+behavior (hit/miss), and MCJIT execution engine lifetime.
 """
 
+import gc
 import math
 
 import pytest
 
 from numba_enzyme.build import build
+from numba_enzyme.core import grad
 from numba_enzyme.runtime import load
 from numba_enzyme.types import Float64
 
@@ -32,16 +34,17 @@ def test_build_produces_correct_gradient():
     assert got == pytest.approx(expected, abs=1e-9)
 
 
-def test_second_build_is_a_cache_hit_with_no_subprocess_calls(monkeypatch):
+def test_second_build_is_a_cache_hit_with_no_recompilation(monkeypatch):
     first = build(f)
     assert first.from_cache is False
 
     import numba_enzyme.build as build_mod
 
     def _boom(*args, **kwargs):
-        raise AssertionError("subprocess.run should not be called on a cache hit")
+        raise AssertionError("recompilation should not occur on a cache hit")
 
-    monkeypatch.setattr(build_mod.subprocess, "run", _boom)
+    monkeypatch.setattr(build_mod, "lower", _boom)
+    monkeypatch.setattr(build_mod, "_run_enzyme_pass", _boom)
 
     second = build(f)
     assert second.from_cache is True
@@ -51,12 +54,12 @@ def test_second_build_is_a_cache_hit_with_no_subprocess_calls(monkeypatch):
 def test_second_build_result_is_actually_usable():
     """
     Regression test: a cache-hit BuiltKernel's symbol names must match
-    what's actually baked into the .so on disk, not be freshly (and
-    differently) recomputed. Numba embeds an internal per-qualname
+    what's actually baked into the object file on disk, not be freshly
+    (and differently) recomputed. Numba embeds an internal per-qualname
     version counter into the mangled symbol name that increments on
     every nb.cfunc compilation of "the same" function, even with
     identical source -- so recomputing symbol names via lower() on a
-    cache hit silently drifts from the names the cached .so actually
+    cache hit silently drifts from the names the cached object actually
     exports. See build()'s meta.json handling.
     """
     build(f)
@@ -74,3 +77,11 @@ def test_different_function_is_a_cache_miss():
     second = build(g)
     assert first.path != second.path
     assert second.from_cache is False
+
+
+def test_grad_closure_retains_mcjit_engine_across_gc():
+    df = grad(f)
+    gc.collect()
+    (got,) = df(1.0)
+    expected = math.cos(1.0) * 1.0 + math.sin(1.0) + 2 * 1.0
+    assert got == pytest.approx(expected, abs=1e-9)

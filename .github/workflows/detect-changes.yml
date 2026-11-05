@@ -17,15 +17,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dorny/paths-filter@v4
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
             tests-relevant:
               - 'src/**'
               - 'tests/**'
+              - 'builddeps/**'
+              - 'patches/**'
+              - 'third_party/**'
+              - 'packaging/**'
+              - '**/BUILD'
+              - 'WORKSPACE'
+              - '**/*.bzl'
+              - '.bazelrc'
+              - '.bazelversion'
+              - 'multitool.lock.json'
               - 'pyproject.toml'
               - 'uv.lock'
-              - 'packaging/build_enzyme_plugin.sh'
+              - '.pre-commit-config.yaml'
               - '.github/workflows/tests.yml'
               - '.github/workflows/detect-changes.yml'

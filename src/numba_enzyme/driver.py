@@ -26,9 +26,10 @@ Examples
 
 from dataclasses import dataclass
 
+import llvmlite.binding as llvm_binding
 from llvmlite import ir
 
-from numba_enzyme.lowering import ArgSpec, LoweredKernel
+from numba_enzyme.lowering import _OPAQUE_POINTERS, ArgSpec, LoweredKernel
 
 _EXCINFO_STRUCT = ir.LiteralStructType(
     [
@@ -55,13 +56,13 @@ def _ir_type_from_str(type_str: str) -> ir.Type:
     Parse an LLVM textual type.
 
     Used to parse arg's type in `LoweredKernel.arg_types` into an
-    `llvmlite.ir` type. Also handling the trailing pointer markes
-    of the base types.
+    `llvmlite.ir` type, handling opaque `"ptr"` as well as trailing
+    pointer markers on base types.
 
     Parameters
     ----------
     type_str : str
-        LLVM ir type as a string e.g. `"double"`,
+        LLVM ir type as a string e.g. `"double"`, `"ptr"`,
         `"i8*"`, `"double*"`.
 
     Returns
@@ -72,9 +73,11 @@ def _ir_type_from_str(type_str: str) -> ir.Type:
     Examples
     --------
     >>> from numba_enzyme.driver import _ir_type_from_str
-    >>> str(_ir_type_from_str("i8*"))
+    >>> str(_ir_type_from_str("ptr"))
     'i8*'
     """
+    if type_str == "ptr":
+        return ir.IntType(8).as_pointer()
     if type_str.endswith("*"):
         return _ir_type_from_str(type_str[:-1]).as_pointer()
     return _SCALAR_IR_TYPE[type_str]
@@ -183,7 +186,10 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     'grad__ZN...'
     """
     retptr_str, _, *flat_strs = kernel.arg_types
-    ret_scalar_type = _SCALAR_IR_TYPE[retptr_str[:-1]]
+    ret_type_name = (
+        retptr_str[:-1] if retptr_str.endswith("*") else kernel.ret_llvm_type
+    )
+    ret_scalar_type = _SCALAR_IR_TYPE[ret_type_name]
     flat_types = [_ir_type_from_str(s) for s in flat_strs]
 
     module = ir.Module(name="numba_enzyme_driver")
@@ -345,9 +351,10 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
         if n_scalar_args == 1
         else ir.LiteralStructType([ret_scalar_type] * n_scalar_args)
     )
+    callee_arg_type = kernel_fn.type if _OPAQUE_POINTERS else i8p
     autodiff_fn = ir.Function(
         module,
-        ir.FunctionType(grad_ret_type, [i8p], var_arg=True),
+        ir.FunctionType(grad_ret_type, [callee_arg_type], var_arg=True),
         name="__enzyme_autodiff",
     )
 
@@ -374,10 +381,10 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     b.store(ir.Constant(ret_scalar_type, 1.0), d_result_ptr)
     excinfo_local = b.alloca(excinfo_ptr_type, name="excinfo")
     b.store(ir.Constant(excinfo_ptr_type, None), excinfo_local)
-    kernel_i8p = b.bitcast(kernel_fn, i8p)
+    kernel_callee = kernel_fn if _OPAQUE_POINTERS else b.bitcast(kernel_fn, i8p)
 
     call_args = [
-        kernel_i8p,
+        kernel_callee,
         b.load(enzyme_dup),
         result_ptr,
         d_result_ptr,
@@ -430,7 +437,7 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     # *tangent* (seed) buffer rather than an output accumulator.
     fwddiff_fn = ir.Function(
         module,
-        ir.FunctionType(ret_scalar_type, [i8p], var_arg=True),
+        ir.FunctionType(ret_scalar_type, [callee_arg_type], var_arg=True),
         name="__enzyme_fwddiff",
     )
 
@@ -458,10 +465,10 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     b2.store(ir.Constant(ret_scalar_type, 0.0), d_result_ptr2)
     excinfo_local2 = b2.alloca(excinfo_ptr_type, name="excinfo")
     b2.store(ir.Constant(excinfo_ptr_type, None), excinfo_local2)
-    kernel_i8p2 = b2.bitcast(kernel_fn, i8p)
+    kernel_callee2 = kernel_fn if _OPAQUE_POINTERS else b2.bitcast(kernel_fn, i8p)
 
     call_args2 = [
-        kernel_i8p2,
+        kernel_callee2,
         b2.load(enzyme_dup),
         result_ptr2,
         d_result_ptr2,
@@ -495,6 +502,13 @@ def synthesise(kernel: LoweredKernel) -> SynthesisedDriver:
     b2.call(fwddiff_fn, call_args2)
     b2.ret(b2.load(d_result_ptr2))
 
-    return SynthesisedDriver(
-        ir=str(module), grad_symbol=grad_symbol, jvp_symbol=jvp_symbol
-    )
+    ir_text = str(module)
+    if _OPAQUE_POINTERS:
+        # `llvmlite.ir` formats legacy typed pointers (`double*`, `i8*`);
+        # round-tripping through `llvmlite.binding.parse_assembly` normalises
+        # the module to opaque-pointer IR (`ptr`) accepted by stock LLVM 17+.
+        parsed_mod = llvm_binding.parse_assembly(ir_text)
+        parsed_mod.verify()
+        ir_text = str(parsed_mod)
+
+    return SynthesisedDriver(ir=ir_text, grad_symbol=grad_symbol, jvp_symbol=jvp_symbol)

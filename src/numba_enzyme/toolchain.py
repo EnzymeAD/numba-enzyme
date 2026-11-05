@@ -1,48 +1,48 @@
 """
-Locate the required external build tools.
+Locate the native Enzyme FFI shared library (`libNumbaEnzyme`).
 
-Resolves the `clang`/`llvm-link`/`opt`/`llvm-extract` binaries
-and the standalone Enzyme LLVM pass plugin. Prioritise
-the `_vendor/` directory shipped alongside this module,
-and falls back to the system-installed, ``PATH``-resolved
-tools used during development.
+Resolves the in-process Enzyme LLVM pass shared library shipped alongside
+this module (in Bazel runfiles, Bazel-built wheels, or `_vendor/`), with
+environment-variable overrides and development-tree fallbacks.
 
 See Also
 --------
-numba_enzyme.build.build : Uses these tools to compile
-    a differentiated kernel.
+numba_enzyme.build.build : Uses this library to link and differentiate
+    lowered kernels in-process.
 
 Examples
 --------
 >>> from numba_enzyme.toolchain import get_toolchain
 >>> toolchain = get_toolchain()  # doctest: +SKIP
->>> toolchain.clang.name  # doctest: +SKIP
-'clang-15'
+>>> toolchain.enzyme_lib.name  # doctest: +SKIP
+'libNumbaEnzyme.so'
 """
 
 import os
-import shutil
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+_PACKAGE_DIR = Path(os.path.abspath(__file__)).parent
+_VENDOR_DIR = _PACKAGE_DIR / "_vendor"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_PLUGIN_PATH = _REPO_ROOT / "enzyme-build" / "Enzyme" / "LLVMEnzyme-15.so"
-_PLUGIN_PATH_ENV_VAR = "NUMBA_ENZYME_PLUGIN_PATH"
-_VENDOR_DIR = Path(__file__).resolve().parent / "_vendor"
+
+_LIB_NAMES = ("libNumbaEnzyme.so", "libNumbaEnzyme.dylib")
+_LIB_PATH_ENV_VAR = "NUMBA_ENZYME_LIB_PATH"
+_LEGACY_PLUGIN_ENV_VAR = "NUMBA_ENZYME_PLUGIN_PATH"
 
 
 class ToolchainError(RuntimeError):
     """
-    Raise when a required build tool cannot be located or used.
+    Raise when the native Enzyme shared library cannot be located or read.
 
-    This covers both a missing tool (not found on ``PATH``, or the
-    Enzyme plugin not found at its configured path) and a tool that
-    exists on disk but is not executable or readable.
+    Covers both a missing shared library (not found in the package, `_vendor/`,
+    or development build directories) and an unreadable file at the configured
+    path.
 
     See Also
     --------
-    get_toolchain : Raises this error when tool resolution fails.
+    get_toolchain : Raises this error when library resolution fails.
 
     Examples
     --------
@@ -57,20 +57,12 @@ class ToolchainError(RuntimeError):
 @dataclass(frozen=True)
 class Toolchain:
     """
-    Resolved and validated paths to the build tools.
+    Resolved and validated path to the native Enzyme shared library.
 
     Attributes
     ----------
-    clang : pathlib.Path
-        Path to the `clang-15` executable.
-    llvm_link : pathlib.Path
-        Path to the `llvm-link-15` executable.
-    opt : pathlib.Path
-        Path to the ``opt-15`` executable.
-    llvm_extract : pathlib.Path
-        Path to the `llvm-extract-15` executable.
-    enzyme_plugin : pathlib.Path
-        Path to the standalone Enzyme LLVM pass plugin (`LLVMEnzyme-15.so`).
+    enzyme_lib : pathlib.Path
+        Path to `libNumbaEnzyme.so` (or `libNumbaEnzyme.dylib`).
 
     See Also
     --------
@@ -79,191 +71,197 @@ class Toolchain:
     Examples
     --------
     >>> from numba_enzyme.toolchain import get_toolchain
-    >>> get_toolchain().opt.name  # doctest: +SKIP
-    'opt-15'
+    >>> get_toolchain().enzyme_lib.is_file()  # doctest: +SKIP
+    True
     """
 
-    clang: Path
-    llvm_link: Path
-    opt: Path
-    llvm_extract: Path
-    enzyme_plugin: Path
+    enzyme_lib: Path
+
+    @property
+    def enzyme_plugin(self) -> Path:
+        """
+        Backward-compatible alias for `enzyme_lib`.
+
+        Returns
+        -------
+        pathlib.Path
+            Path to the resolved `libNumbaEnzyme` shared library.
+
+        See Also
+        --------
+        Toolchain : Carries `enzyme_lib` as its primary attribute.
+
+        Examples
+        --------
+        >>> from numba_enzyme.toolchain import get_toolchain
+        >>> tc = get_toolchain()  # doctest: +SKIP
+        >>> tc.enzyme_plugin == tc.enzyme_lib  # doctest: +SKIP
+        True
+        """
+        return self.enzyme_lib
 
 
-def _which(name: str) -> Path | None:
+def _first_existing(directory: Path) -> Path | None:
     """
-    Resolve an executable's absolute path in ``PATH``.
+    Find the first existing `libNumbaEnzyme` file in a directory.
 
     Parameters
     ----------
-    name : str
-        Name of the executable to look up, e.g. ``"clang-15"``.
+    directory : pathlib.Path
+        Directory to probe for `_LIB_NAMES`.
 
     Returns
     -------
     pathlib.Path or None
-        The resolved absolute path, or `None` if `name` is not found in
-        ``PATH``.
+        Path to the first matching file, or `None` if absent.
+
+    See Also
+    --------
+    get_toolchain : Calls this helper across candidate directories.
 
     Examples
     --------
-    >>> from numba_enzyme.toolchain import _which
-    >>> _which("arbitrary-tool") is None
+    >>> from pathlib import Path
+    >>> from numba_enzyme.toolchain import _first_existing
+    >>> _first_existing(Path("/nonexistent-numba-enzyme-dir")) is None
     True
     """
-    found = shutil.which(name)
-    return Path(found) if found else None
+    for name in _LIB_NAMES:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
-def _resolve_vendored() -> Toolchain | None:
+def _resolve_packaged() -> Toolchain | None:
     """
-    Resolve tools from the `_vendor/` directory shipped in a wheel.
+    Resolve `libNumbaEnzyme` shipped inside the package or `_vendor/`.
+
+    Checks `_VENDOR_DIR` first (used by Hatch wheel builds) and then
+    `_PACKAGE_DIR` (used by Bazel wheels and Bazel test runfiles).
 
     Returns
     -------
     Toolchain or None
-        The vendored paths, or `None` if `_vendor/` doesn't exist
-        (e.g. running from source rather than an installed wheel).
+        The packaged library toolchain, or `None` if neither location
+        contains `libNumbaEnzyme`.
 
     See Also
     --------
-    _resolve_system : The fallback used when this returns `None`.
+    _resolve_dev : Fallback used during local source development.
 
     Examples
     --------
-    >>> from numba_enzyme.toolchain import _resolve_vendored
-    >>> _resolve_vendored() is None  # doctest: +SKIP
-    True
+    >>> from numba_enzyme.toolchain import _resolve_packaged
+    >>> _resolve_packaged()  # doctest: +SKIP
+    Toolchain(enzyme_lib=PosixPath('.../libNumbaEnzyme.so'))
     """
-    vendored_clang = _VENDOR_DIR / "bin" / "clang"
-    if not vendored_clang.is_file():
-        return None
-    return Toolchain(
-        clang=vendored_clang,
-        llvm_link=_VENDOR_DIR / "bin" / "llvm-link",
-        opt=_VENDOR_DIR / "bin" / "opt",
-        llvm_extract=_VENDOR_DIR / "bin" / "llvm-extract",
-        enzyme_plugin=_VENDOR_DIR / "enzyme" / "LLVMEnzyme-15.so",
-    )
+    for directory in (_VENDOR_DIR, _PACKAGE_DIR):
+        found = _first_existing(directory)
+        if found is not None:
+            return Toolchain(enzyme_lib=found)
+    return None
 
 
-def _resolve_system() -> tuple[Toolchain | None, list[str]]:
+def _resolve_dev() -> tuple[Toolchain | None, list[Path]]:
     """
-    Resolve tools from the system ``PATH`` (the development-mode path).
+    Resolve `libNumbaEnzyme` from local development build directories.
+
+    Checks `enzyme-build/` (populated by `packaging/build_enzyme_plugin.sh`)
+    and `bazel-bin/src/numba_enzyme/` (populated by `bazel build`).
 
     Returns
     -------
     Toolchain or None
-        The resolved paths, or `None` if any required tool is missing.
-    list of str
-        A description of each missing tool, empty if none are missing.
+        The resolved development library, or `None` if not built yet.
+    list of pathlib.Path
+        Directories searched when resolution returns `None`.
 
     See Also
     --------
-    _resolve_vendored : Tried first, before this fallback.
+    _resolve_packaged : Checked before falling back to development paths.
 
     Examples
     --------
-    >>> from numba_enzyme.toolchain import _resolve_system
-    >>> _resolve_system()  # doctest: +SKIP
-    (Toolchain(clang=..., llvm_link=..., opt=..., enzyme_plugin=...), [])
+    >>> from numba_enzyme.toolchain import _resolve_dev
+    >>> _resolve_dev()  # doctest: +SKIP
+    (Toolchain(enzyme_lib=...), [...])
     """
-    clang = _which("clang-15")
-    llvm_link = _which("llvm-link-15")
-    opt = _which("opt-15")
-    llvm_extract = _which("llvm-extract-15")
-
-    plugin_override = os.environ.get(_PLUGIN_PATH_ENV_VAR)
-    enzyme_plugin = Path(plugin_override) if plugin_override else _DEFAULT_PLUGIN_PATH
-
-    missing = []
-    if clang is None:
-        missing.append("clang-15 (not found on PATH)")
-    if llvm_link is None:
-        missing.append("llvm-link-15 (not found on PATH)")
-    if opt is None:
-        missing.append("opt-15 (not found on PATH)")
-    if llvm_extract is None:
-        missing.append("llvm-extract-15 (not found on PATH)")
-    if not enzyme_plugin.is_file():
-        missing.append(
-            f"Enzyme plugin (not found at {enzyme_plugin}; "
-            f"override with the {_PLUGIN_PATH_ENV_VAR} env var)"
-        )
-    if missing:
-        return None, missing
-
-    return (
-        Toolchain(
-            clang=clang,
-            llvm_link=llvm_link,
-            opt=opt,
-            llvm_extract=llvm_extract,
-            enzyme_plugin=enzyme_plugin,
-        ),
-        [],
-    )
+    dev_dirs = [
+        _REPO_ROOT / "enzyme-build",
+        _REPO_ROOT / "bazel-bin" / "src" / "numba_enzyme",
+    ]
+    for directory in dev_dirs:
+        found = _first_existing(directory)
+        if found is not None:
+            return Toolchain(enzyme_lib=found), dev_dirs
+    return None, dev_dirs
 
 
 @lru_cache(maxsize=1)
 def get_toolchain() -> Toolchain:
     """
-    Resolve and validate every build tool.
+    Resolve and validate the native Enzyme shared library.
 
-    Priorities the `_vendor/` directory shipped alongside
-    this module in a built wheel; falls back to
-    ``clang-15``/``llvm-link-15``/``opt-15`` on ``PATH``
-    and the standalone Enzyme LLVM pass plugin at a path
-    relative to the repository root otherwise (configurable
-    via the ``NUMBA_ENZYME_PLUGIN_PATH`` environment variable)
+    Resolution order:
+
+    1. Environment variable override (`NUMBA_ENZYME_LIB_PATH`, or legacy
+       `NUMBA_ENZYME_PLUGIN_PATH`).
+    2. Packaged library in `_vendor/` or alongside `numba_enzyme` (Bazel
+       wheels and runfiles).
+    3. Local development build outputs in `enzyme-build/` or
+       `bazel-bin/src/numba_enzyme/`.
+
     The result is cached after the first successful call.
 
     Returns
     -------
     Toolchain
-        The resolved, validated paths of the build tools.
+        The resolved and validated path to `libNumbaEnzyme`.
 
     Raises
     ------
     ToolchainError
-        If any tool is missing, or exists but is not
-        executable/readable.
+        If `libNumbaEnzyme` cannot be found or is not readable.
 
     See Also
     --------
-    Toolchain : The return resolved paths.
+    Toolchain : Dataclass holding the resolved `enzyme_lib` path.
 
     Examples
     --------
     >>> from numba_enzyme.toolchain import get_toolchain
     >>> get_toolchain()  # doctest: +SKIP
-    Toolchain(clang=..., llvm_link=..., opt=..., enzyme_plugin=...)
+    Toolchain(enzyme_lib=PosixPath('.../libNumbaEnzyme.so'))
 
-    Force re-resolution (e.g. in tests that change the environment)::
+    Force re-resolution (e.g. in tests that change the environment):
 
     >>> get_toolchain.cache_clear()
     """
-    toolchain = _resolve_vendored()
-    if toolchain is None:
-        toolchain, missing = _resolve_system()
+    override = os.environ.get(_LIB_PATH_ENV_VAR) or os.environ.get(
+        _LEGACY_PLUGIN_ENV_VAR
+    )
+    if override:
+        toolchain = Toolchain(enzyme_lib=Path(override))
+    else:
+        toolchain = _resolve_packaged()
         if toolchain is None:
-            raise ToolchainError(
-                "missing required build tool(s):\n  - " + "\n  - ".join(missing)
-            )
+            toolchain, searched_dirs = _resolve_dev()
+            if toolchain is None:
+                searched = ", ".join(
+                    str(d) for d in (_VENDOR_DIR, _PACKAGE_DIR, *searched_dirs)
+                )
+                raise ToolchainError(
+                    f"libNumbaEnzyme shared library not found (searched: "
+                    f"{searched}); build with `bazel build "
+                    "//src/numba_enzyme:libNumbaEnzyme.so` or "
+                    "`bash packaging/build_enzyme_plugin.sh enzyme-build`, or "
+                    f"override via {_LIB_PATH_ENV_VAR}"
+                )
 
-    for tool in (
-        toolchain.clang,
-        toolchain.llvm_link,
-        toolchain.opt,
-        toolchain.llvm_extract,
-    ):
-        if not tool.is_file():
-            raise ToolchainError(f"{tool} does not exist")
-        if not os.access(tool, os.X_OK):
-            raise ToolchainError(f"{tool} exists but is not executable")
-    if not toolchain.enzyme_plugin.is_file():
-        raise ToolchainError(f"{toolchain.enzyme_plugin} does not exist")
-    if not os.access(toolchain.enzyme_plugin, os.R_OK):
-        raise ToolchainError(f"{toolchain.enzyme_plugin} exists but is not readable")
+    if not toolchain.enzyme_lib.is_file():
+        raise ToolchainError(f"{toolchain.enzyme_lib} does not exist")
+    if not os.access(toolchain.enzyme_lib, os.R_OK):
+        raise ToolchainError(f"{toolchain.enzyme_lib} exists but is not readable")
 
     return toolchain

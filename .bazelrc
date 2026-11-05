@@ -1,0 +1,35 @@
+# Public read-only cache
+common:public_cache --remote_cache="https://storage.googleapis.com/enzyme-presubmit-bazel-cache/" --remote_upload_local_results=false
+
+# Cache pushes are limited to Enzyme's CI system.
+common:public_cache_push --config=public_cache --remote_upload_local_results=true --google_default_credentials
+
+common --noenable_bzlmod
+common --noincompatible_enable_cc_toolchain_resolution
+common --enable_platform_specific_config
+common --announce_rc
+common --color=yes
+
+common --cxxopt=-std=c++17 --host_cxxopt=-std=c++17
+common --cxxopt=-fvisibility=hidden --host_cxxopt=-fvisibility=hidden
+common --cxxopt=-fvisibility-inlines-hidden --host_cxxopt=-fvisibility-inlines-hidden
+common --cxxopt=-Wno-deprecated-declarations --host_cxxopt=-Wno-deprecated-declarations
+common --cxxopt=-Wno-sign-compare --host_cxxopt=-Wno-sign-compare
+common --cxxopt=-Wno-comment --host_cxxopt=-Wno-comment
+common --cxxopt=-Wno-return-type --host_cxxopt=-Wno-return-type
+common --cxxopt=-Wno-unused-function --host_cxxopt=-Wno-unused-function
+common --cxxopt=-Wno-unused-variable --host_cxxopt=-Wno-unused-variable
+common --cxxopt=-Wno-parentheses --host_cxxopt=-Wno-parentheses
+common --cxxopt=-Wno-reorder --host_cxxopt=-Wno-reorder
+
+common:linux --copt=-ffunction-sections --copt=-fdata-sections
+common:macos --cxxopt=-faligned-allocation --host_cxxopt=-faligned-allocation
+common:macos --cxxopt=-Wno-nullability-completeness --host_cxxopt=-Wno-nullability-completeness
+build:macos --macos_minimum_os=12.0 --host_macos_minimum_os=12.0
+
+# Disable rules_python precompile to avoid action conflicts across configurations.
+# See https://github.com/bazel-contrib/rules_python/issues/2445
+build --@rules_python//python/config_settings:precompile=force_disabled
+build --incompatible_default_to_explicit_init_py
+
+build -c opt

@@ -4,73 +4,124 @@ on:
   push:
     tags: ["v*"]
   release:
-    types: [published]
+    types: [created, published]
   workflow_dispatch:
 
 jobs:
-  build-image:
-    name: Build manylinux container image
-    runs-on: ubuntu-latest
+  build-wheels:
+    name: Build wheel - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ (contains(matrix.os, 'ubuntu') && 'ghcr.io/enzymead/reactant-docker-images_22.04@sha256:3a4edb524a77b28cffdb9589fa23d0e4a43fec7da85f531e92ff6803fd62106f') || '' }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macOS-latest
+    timeout-minutes: 240
+    env:
+      HERMETIC_PYTHON_VERSION: "3.11"
     steps:
+      - name: Set BAZEL_FLAGS
+        shell: bash
+        run: |
+          set -euo pipefail
+          BAZEL_FLAGS=""
+          if [ "${{ runner.arch }}" = "ARM64" ] && [ "${{ runner.os }}" = "Linux" ]; then
+            BAZEL_FLAGS="${BAZEL_FLAGS} --linkopt=-fuse-ld=lld"
+          fi
+          if command -v clang >/dev/null 2>&1; then
+            BAZEL_FLAGS="${BAZEL_FLAGS} --repo_env=CC=$(command -v clang)"
+          fi
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            BAZEL_FLAGS="${BAZEL_FLAGS} --config=public_cache"
+          fi
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            BAZEL_FLAGS="${BAZEL_FLAGS} --cxxopt=-Wno-nullability-completeness --host_cxxopt=-Wno-nullability-completeness"
+          fi
+          echo "BAZEL_FLAGS=${BAZEL_FLAGS}" >> "${GITHUB_ENV}"
+
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
-
-      # Cached via GHA's own cache backend -- the image build compiles
-      # three CPython versions from source, expensive enough to be
-      # worth caching aggressively between runs.
-      - uses: docker/build-push-action@v6
+      - uses: bazel-contrib/setup-bazel@0.19.1
+        name: Set up Bazel
         with:
-          context: .
-          file: packaging/Dockerfile.manylinux
-          tags: numba-enzyme-manylinux:latest
-          push: false
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          bazelisk-cache: true
+          disk-cache: ${{ format('wheel-{0}-{1}', github.workflow, matrix.os) }}
+          cache-save: true
+          repository-cache: true
+          bazelisk-version: 1.x
 
-      - name: Save image for later jobs
-        run: docker save numba-enzyme-manylinux:latest -o /tmp/numba-enzyme-manylinux.tar
+      - name: Sync version from git tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "Setting package version to ${TAG}"
+          sed -i.bak "s~version = \"[0-9][0-9.]*\"~version = \"${TAG}\"~g" BUILD pyproject.toml
+          sed -i.bak "s~__version__ = \"[0-9][0-9.]*\"~__version__ = \"${TAG}\"~g" src/numba_enzyme/__init__.py
+          rm -f BUILD.bak pyproject.toml.bak src/numba_enzyme/__init__.py.bak
+
+      - name: Build wheel
+        run: |
+          bazel build $BAZEL_FLAGS --color=yes //:wheel
+
+      - name: Collect wheel
+        shell: bash
+        run: |
+          mkdir -p wheelhouse
+          cp -v bazel-bin/numba_enzyme-*.whl wheelhouse/
+          ls -lh wheelhouse/*.whl
 
       - uses: actions/upload-artifact@v4
         with:
-          name: manylinux-image
-          path: /tmp/numba-enzyme-manylinux.tar
-          retention-days: 1
+          name: wheel-${{ matrix.os }}
+          path: wheelhouse/*.whl
 
-  build-wheels:
-    name: Build wheels
-    needs: build-image
-    runs-on: ubuntu-latest
+  smoke-test-wheels:
+    name: Smoke test wheel - ${{ matrix.os }}
+    needs: build-wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macOS-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: manylinux-image
-          path: /tmp
+          name: wheel-${{ matrix.os }}
+          path: wheelhouse
 
-      - name: Load manylinux image
-        run: docker load -i /tmp/numba-enzyme-manylinux.tar
+      - uses: astral-sh/setup-uv@v6
 
-      # Pinned to the exact version (4.1.1) for cp39-cp39
-      # compatibility.
-      - name: Build wheels
-        uses: pypa/cibuildwheel@v4.1.1
-        env:
-          CIBW_MANYLINUX_X86_64_IMAGE: numba-enzyme-manylinux:latest
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels
-          path: wheelhouse/*.whl
-
-      - name: Report wheel sizes
-        run: ls -lh wheelhouse/*.whl
+      - name: Install wheel into clean Python 3.11-3.15 venvs and run smoke + pytest
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL="$(pwd)/$(ls wheelhouse/numba_enzyme-*.whl)"
+          SMOKE_SCRIPT="$(pwd)/packaging/smoke_test.py"
+          cp -r tests /tmp/smoke-tests
+          cd /tmp
+          for py in 3.11 3.12 3.13 3.14 3.15; do
+            echo "=== Smoke testing wheel on Python ${py} ==="
+            VENV="/tmp/smoke-venv-${py}"
+            uv venv --python "${py}" "${VENV}"
+            uv pip install --python "${VENV}/bin/python" "${WHEEL}" pytest numpy
+            "${VENV}/bin/python" "${SMOKE_SCRIPT}"
+            "${VENV}/bin/pytest" -v /tmp/smoke-tests -k "not test_import"
+            rm -rf "${VENV}"
+          done
 
   publish-testpypi:
     name: Publish to TestPyPI
-    needs: build-wheels
+    needs: [build-wheels, smoke-test-wheels]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment:
@@ -81,8 +132,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: wheels
+          pattern: wheel-*
           path: wheelhouse
+          merge-multiple: true
 
       - uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
@@ -91,7 +143,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    needs: build-wheels
+    needs: [build-wheels, smoke-test-wheels]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
     runs-on: ubuntu-latest
     environment:
@@ -102,8 +154,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: wheels
+          pattern: wheel-*
           path: wheelhouse
+          merge-multiple: true
 
       - uses: pypa/gh-action-pypi-publish@v1.14.2
         with:

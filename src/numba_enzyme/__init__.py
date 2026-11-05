@@ -4,8 +4,8 @@ Differentiate Numba-compiled functions with Enzyme.
 This package makes a pure-math Python function (annotated with
 :mod:`numba_enzyme.types`) differentiable by compiling it with Numba,
 synthesising an Enzyme driver for it with :mod:`llvmlite`, and running
-the standalone Enzyme LLVM pass over the result. Both reverse-mode
-gradients and forward-mode Jacobian-vector products are supported.
+the Enzyme LLVM pass over the result. Both reverse-mode gradients and
+forward-mode Jacobian-vector products are supported.
 
 See Also
 --------
@@ -27,10 +27,13 @@ Examples
 (1.0806046117362795, 0.8414709848078965)
 """
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 from numba_enzyme.core import Differentiable, differentiable, grad, jvp
 
-__version__ = version("numba-enzyme")
+try:
+    __version__ = version("numba-enzyme")
+except PackageNotFoundError:
+    __version__ = "0.1.3"
 
 __all__ = ["Differentiable", "differentiable", "grad", "jvp"]
