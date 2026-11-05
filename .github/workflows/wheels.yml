@@ -50,7 +50,7 @@ jobs:
         with:
           bazelisk-cache: true
           disk-cache: ${{ format('wheel-{0}-{1}', github.workflow, matrix.os) }}
-          cache-save: always
+          cache-save: true
           repository-cache: true
           bazelisk-version: 1.x
 

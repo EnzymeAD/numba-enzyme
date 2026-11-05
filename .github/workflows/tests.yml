@@ -77,8 +77,8 @@ jobs:
         name: Set up Bazel
         with:
           bazelisk-cache: true
-          disk-cache: ${{ format('test-{0}-{1}', github.workflow, matrix.os) }}
-          cache-save: always
+          disk-cache: ${{ runner.os == 'macOS' && format('test-{0}-{1}-3.11', github.workflow, matrix.os) || format('test-{0}-{1}', github.workflow, matrix.os) }}
+          cache-save: true
           repository-cache: true
           bazelisk-version: 1.x
 
