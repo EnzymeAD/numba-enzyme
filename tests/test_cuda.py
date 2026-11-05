@@ -99,10 +99,11 @@ def test_compute_capability_parser(text, expected):
 
 def test_compute_capability_matches_llvm_15_bridge():
     assert _validate_compute_capability((8, 9)) == (8, 9)
+    # Blackwell goes through the same LLVM 7 dialect as everything before it.
+    assert _validate_compute_capability((10, 0)) == (10, 0)
+    assert _validate_compute_capability((12, 0)) == (12, 0)
     with pytest.raises(CUDAEnzymeError, match=r"7.0\+"):
         _validate_compute_capability((6, 1))
-    with pytest.raises(CUDAEnzymeError, match="Blackwell"):
-        _validate_compute_capability((10, 0))
 
 
 def test_generated_driver_uses_scalar_c_abi_entry_points():
@@ -202,10 +203,20 @@ def test_nvvm_sanitizer_rewrites_optimiser_loop_guards():
         "declare i64 @llvm.smax.i64(i64, i64) #0\n"
         "declare i32 @llvm.umin.i32(i32, i32) #0\n"
     )
-    assert "freeze" not in sanitized and "llvm.smax" not in sanitized and "llvm.umin" not in sanitized
-    assert "%smax.cmp = icmp sgt i64 %jac_cols, 1\n  %smax = select i1 %smax.cmp, i64 %jac_cols, i64 1" in sanitized
+    assert (
+        "freeze" not in sanitized
+        and "llvm.smax" not in sanitized
+        and "llvm.umin" not in sanitized
+    )
+    assert (
+        "%smax.cmp = icmp sgt i64 %jac_cols, 1\n  %smax = select i1 %smax.cmp, i64 %jac_cols, i64 1"
+        in sanitized
+    )
     assert "%i = bitcast i64 %smax to i64" in sanitized
-    assert "%n.cmp = icmp ult i32 %a, 7\n  %n = select i1 %n.cmp, i32 %a, i32 7" in sanitized
+    assert (
+        "%n.cmp = icmp ult i32 %a, 7\n  %n = select i1 %n.cmp, i32 %a, i32 7"
+        in sanitized
+    )
 
 
 def test_core_returns_lazy_cuda_derivatives_without_compiling(monkeypatch):
@@ -998,6 +1009,99 @@ _TUPLE_ARGUMENT_SIGNATURE = types.UniTuple(types.float64, 2)(
 )
 
 
+_BLACKWELL = [(10, 0), (12, 0)]
+
+
+@pytest.mark.parametrize("cc", _BLACKWELL)
+def test_blackwell_lowers_through_the_llvm_7_dialect(cc):
+    """sm_100+ lowers to typed pointers, which the LLVM 15 tools can read."""
+
+    _require_numba_cuda_mlir_compiler()
+    from numba_enzyme.cuda import lower_cuda
+
+    kernel = lower_cuda(
+        tuple_argument_device, signature=_TUPLE_ARGUMENT_SIGNATURE, cc=cc
+    )
+    assert kernel.compute_capability == cc
+    # Not Numba-CUDA-MLIR's own Blackwell dialect, whose opaque ``ptr`` the
+    # LLVM 15 tools reject.
+    assert "ModuleID = 'llvm70_module'" in kernel.ir
+    assert not re.search(r"\bptr\b", kernel.ir)
+
+
+@pytest.mark.parametrize("cc", _BLACKWELL)
+@pytest.mark.parametrize("modes", [("jvp",), ("vjp", "jacrev")])
+def test_blackwell_pipeline_emits_lto_ir(cc, modes):
+    """A tuple-argument primal differentiates for Blackwell, offline."""
+
+    _require_numba_cuda_mlir_compiler()
+    built = build_cuda(
+        tuple_argument_device,
+        signature=_TUPLE_ARGUMENT_SIGNATURE,
+        cc=cc,
+        modes=modes,
+    )
+    assert built.code[:4] == b"\xedCN\x7f"
+
+
+@pytest.mark.parametrize("cc", _BLACKWELL)
+def test_blackwell_derivative_links_into_a_blackwell_kernel(cc):
+    """nvJitLink links the LLVM 7 derivative with an LLVM 20 caller.
+
+    The caller is compiled by Numba-CUDA-MLIR's own Blackwell path, so this is
+    the mixed-dialect link a real kernel on such a GPU performs. Compiling a
+    kernel initialises the driver, so it needs some GPU, though not this one.
+    """
+
+    if not cuda.is_available():
+        pytest.skip("a CUDA GPU is not available")
+    _require_numba_cuda_mlir_compiler()
+    from cuda.bindings import nvjitlink
+    from numba_cuda_mlir.compiler import compile as compile_kernel
+
+    sweep = jvp(tuple_argument_device, signature=_TUPLE_ARGUMENT_SIGNATURE, cc=cc)
+
+    def kernel(y, p, out):
+        col = cuda.local.array(2, types.float64)
+        ys = cuda.local.array(2, types.float64)
+        ps = cuda.local.array(1, types.float64)
+        dys = cuda.local.array(2, types.float64)
+        dps = cuda.local.array(1, types.float64)
+        ys[0], ys[1], ps[0] = y[0], y[1], p[0]
+        dys[0], dys[1], dps[0] = 1.0, 0.0, 0.0
+        sweep(col, ys, 0.25, ps, dys, 0.0, dps)
+        out[0], out[1] = col[0], col[1]
+
+    array = types.Array(types.float64, 1, "C")
+    caller, _ = compile_kernel(
+        kernel,
+        types.void(array, array, array),
+        device=False,
+        abi="numba",
+        cc=cc,
+        output="ltoir",
+    )
+    built = build_cuda(
+        tuple_argument_device,
+        signature=_TUPLE_ARGUMENT_SIGNATURE,
+        cc=cc,
+        modes=("jvp",),
+    )
+    handle = nvjitlink.create(3, [f"-arch=sm_{cc[0]}{cc[1]}", "-lto", "-ptx"])
+    try:
+        for name, code in (("caller", caller), ("derivative", built.code)):
+            nvjitlink.add_data(handle, nvjitlink.InputType.LTOIR, code, len(code), name)
+        nvjitlink.complete(handle)
+        ptx = bytearray(nvjitlink.get_linked_ptx_size(handle))
+        nvjitlink.get_linked_ptx(handle, ptx)
+    finally:
+        nvjitlink.destroy(handle)
+    ptx = bytes(ptx).decode()
+    assert f".target sm_{cc[0]}{cc[1]}" in ptx
+    # Inlined: no call is left to the derivative's entry point.
+    assert "numba_enzyme_jvp" not in ptx
+
+
 def test_argument_widths_and_flat_count():
     from numba_enzyme.cuda import _argument_widths, _flat_argument_count
 
@@ -1204,8 +1308,12 @@ def test_prepasses_default_and_override(monkeypatch):
 
     def key():
         return _cuda_cache_key(
-            tuple_device, (types.float64, types.float64), types.UniTuple(types.float64, 2),
-            (8, 9), frozenset({"jvp"}), "; ir",
+            tuple_device,
+            (types.float64, types.float64),
+            types.UniTuple(types.float64, 2),
+            (8, 9),
+            frozenset({"jvp"}),
+            "; ir",
         )
 
     monkeypatch.setenv(_PREPASSES_ENV_VAR, "none")
@@ -1261,7 +1369,9 @@ def test_tuple_jvp_differentiates_loops_over_the_state():
     n = N_LOOPED
     cc = cuda.get_current_device().compute_capability
     signature = types.UniTuple(types.float64, n)(
-        types.UniTuple(types.float64, n), types.float64, types.UniTuple(types.float64, 2)
+        types.UniTuple(types.float64, n),
+        types.float64,
+        types.UniTuple(types.float64, 2),
     )
     tangent_of = jvp(looped_device, signature=signature, cc=cc)
 
@@ -1279,7 +1389,9 @@ def test_tuple_jvp_differentiates_loops_over_the_state():
     seeds[np.arange(n), np.arange(n)] = 1.0
     jac = cuda.device_array((n, n), dtype=np.float64)
     kernel[1, 1](cuda.to_device(y), 1.0, cuda.to_device(p), cuda.to_device(seeds), jac)
-    np.testing.assert_allclose(jac.copy_to_host(), _looped_jacobian(*p), rtol=1e-12, atol=1e-14)
+    np.testing.assert_allclose(
+        jac.copy_to_host(), _looped_jacobian(*p), rtol=1e-12, atol=1e-14
+    )
 
 
 def test_tuple_jvp_composes_into_a_second_derivative():

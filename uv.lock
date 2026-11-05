@@ -536,7 +536,7 @@ cu12 = [
 
 [[package]]
 name = "numba-enzyme-cuda"
-version = "0.2.2"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "llvmlite" },

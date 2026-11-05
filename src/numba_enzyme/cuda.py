@@ -85,6 +85,8 @@ def _prepasses() -> str:
     if value is None:
         return _DEFAULT_PREPASSES
     return "" if value.strip().lower() in _PREPASSES_OFF else value.strip()
+
+
 _LOADED_CUDA_DERIVATIVES = {}
 _LOAD_LOCK = threading.RLock()
 _MLIR_COMPILE_LOCK = threading.RLock()
@@ -261,9 +263,7 @@ def _cuda_imports():
             _call_llvm70_capi,
             _compile_to_ltoir,
             _compile_to_ptx,
-            _needs_llvm70_path,
             _nvvm_options,
-            _prepare_llvm_ir,
             get_base_pipeline,
         )
         from numba_cuda_mlir.numba_cuda.cudadrv.nvvm import LibDevice
@@ -283,9 +283,7 @@ def _cuda_imports():
         "compile_to_ltoir": _compile_to_ltoir,
         "compile_to_ptx": _compile_to_ptx,
         "llvm70_ir": _call_llvm70_capi,
-        "needs_llvm70": _needs_llvm70_path,
         "nvvm_options": _nvvm_options,
-        "prepare_llvm_ir": _prepare_llvm_ir,
         "base_pipeline": get_base_pipeline,
         "LibDevice": LibDevice,
         "pre_codegen": run_pre_codegen_patterns,
@@ -615,7 +613,11 @@ def _compute_capability(cc, tools) -> tuple[int, int]:
 
 def _validate_compute_capability(cc):
     """
-    Validate the GPU architecture supported by the LLVM 15 bridge.
+    Validate a GPU architecture for the LLVM 15 bridge.
+
+    Every architecture Numba-CUDA-MLIR targets is lowered through its LLVM 7
+    dialect (see `lower_cuda`), so Blackwell (10.x and 12.x) is supported
+    alongside Volta through Hopper; only the floor remains.
 
     Parameters
     ----------
@@ -630,17 +632,11 @@ def _validate_compute_capability(cc):
     Raises
     ------
     CUDAEnzymeError
-        If the architecture needs an older or newer compiler path.
+        If the architecture predates Numba-CUDA-MLIR's support.
     """
 
     if cc < (7, 0):
         raise CUDAEnzymeError("Numba-CUDA-MLIR requires compute capability 7.0+")
-    if cc >= (10, 0):
-        raise CUDAEnzymeError(
-            "CUDA differentiation currently supports compute capabilities 7.x-9.x; "
-            "Blackwell's LLVM 20 NVVM path is incompatible with the bundled LLVM 15 "
-            "Enzyme plugin"
-        )
     return cc
 
 
@@ -732,24 +728,25 @@ def lower_cuda(func, signature=None, cc=None) -> CUDALoweredKernel:
             pass_manager = backend["PassManager"].parse(backend["base_pipeline"]())
             pass_manager.run(module.operation)
             backend["pre_codegen"](module)
+            # Always the LLVM 7 dialect, Blackwell included. Numba-CUDA-MLIR
+            # gives sm_100 and up its LLVM 20 dialect, whose opaque pointers
+            # and newer attributes the vendored LLVM 15 tools cannot read
+            # (``-opaque-pointers=0``) and which the synthesised driver, typed
+            # pointers throughout, could not link against. libNVVM still
+            # accepts the LLVM 7 dialect for every Blackwell target, and the
+            # LTO IR it produces links with a caller compiled through the LLVM
+            # 20 dialect, since nvJitLink sees only LTO IR.
             chip = f"sm_{compute_capability[0]}{compute_capability[1]}"
-            if backend["needs_llvm70"](chip):
-                llvm_bytes = backend["llvm70_ir"](
-                    module,
-                    {
-                        "chip": chip,
-                        "opt_level": 0 if options.get("opt") is False else 3,
-                        "debug": compile_options["debug"],
-                        "lineinfo": compile_options["lineinfo"],
-                    },
-                    gen_llvmir=True,
-                )
-            else:
-                llvm_bytes = backend["prepare_llvm_ir"](
-                    module,
-                    preserve_debug_info=compile_options["debug"]
-                    or compile_options["lineinfo"],
-                )
+            llvm_bytes = backend["llvm70_ir"](
+                module,
+                {
+                    "chip": chip,
+                    "opt_level": 0 if options.get("opt") is False else 3,
+                    "debug": compile_options["debug"],
+                    "lineinfo": compile_options["lineinfo"],
+                },
+                gen_llvmir=True,
+            )
 
     # Numba-CUDA-MLIR mangles the qualified name, which for a nested or
     # generated function is not its __name__: a closure's primal would
@@ -1892,7 +1889,12 @@ def _sanitize_for_libnvvm(llvm_ir: str) -> str:
         min_max,
         llvm_ir,
     )
-    llvm_ir = re.sub(r"^declare[^\n]*@llvm\.[su](?:min|max)\.i\d+\([^\n]*\n", "", llvm_ir, flags=re.MULTILINE)
+    llvm_ir = re.sub(
+        r"^declare[^\n]*@llvm\.[su](?:min|max)\.i\d+\([^\n]*\n",
+        "",
+        llvm_ir,
+        flags=re.MULTILINE,
+    )
 
     # Enzyme expresses derivatives of libdevice calls using standard LLVM math
     # intrinsics.  CUDA 12's libNVVM rejects several of those intrinsics, but

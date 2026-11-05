@@ -269,9 +269,15 @@ homogeneous scalar inputs, returning one scalar or a homogeneous tuple of them.
 A primal that writes its outputs through an array argument is not supported;
 neither are other array inputs, mixed types, activity annotations, general
 mutation, or kernel (`device=False`) differentiation. Derivatives must be called from CUDA-compiled code, not the host.
-The LLVM 15 Enzyme bridge currently supports compute capabilities 7.x through
-9.x; Numba-CUDA-MLIR's LLVM 20 path for Blackwell (10.x+) needs a matching
-newer Enzyme toolchain.
+Every compute capability from 7.0 up is supported, Blackwell (10.x and 12.x)
+included. Numba-CUDA-MLIR lowers Blackwell through its LLVM 20 dialect, which
+the LLVM 15 Enzyme bridge cannot read, so derivatives are always lowered
+through its LLVM 7 dialect instead: libNVVM accepts that dialect for every
+target, and nvJitLink links the resulting LTO IR into a caller compiled through
+either. Blackwell needs CUDA 12.8 or later, and libNVVM and nvJitLink from the
+same toolkit release: Numba-CUDA-MLIR 0.5.1's Blackwell LTO IR is rejected by
+nvJitLink 13.4 and later ("Target-incompatible DataLayout"), whether or not a
+derivative is linked, which 0.5.4 fixes.
 
 ### Development
 
