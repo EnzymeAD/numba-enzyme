@@ -1,7 +1,7 @@
 """
 Differentiate Numba-compiled functions with Enzyme.
 
-This package makes a pure-math Python function (annotated with
+This package makes a pure-math Python function (optionally annotated with
 :mod:`numba_enzyme.types`) differentiable by compiling it with Numba,
 synthesising an Enzyme driver for it with :mod:`llvmlite`, and running
 the standalone Enzyme LLVM pass over the result. Both reverse-mode
@@ -27,10 +27,33 @@ Examples
 (1.0806046117362795, 0.8414709848078965)
 """
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
-from numba_enzyme.core import Differentiable, differentiable, grad, jvp
+from numba_enzyme.core import (
+    Differentiable,
+    differentiable,
+    grad,
+    jacfwd,
+    jacrev,
+    jvp,
+    vjp,
+)
 
-__version__ = version("numba-enzyme")
+# The distribution is numba-enzyme-cuda; upstream's name is the fallback, so
+# this package imports whichever of the two supplied it. Looking up only the
+# name it was published under is what made the first numba-enzyme-cuda wheel
+# fail at import.
+try:
+    __version__ = version("numba-enzyme-cuda")
+except PackageNotFoundError:  # pragma: no cover - upstream distribution
+    __version__ = version("numba-enzyme")
 
-__all__ = ["Differentiable", "differentiable", "grad", "jvp"]
+__all__ = [
+    "Differentiable",
+    "differentiable",
+    "grad",
+    "jacfwd",
+    "jacrev",
+    "jvp",
+    "vjp",
+]

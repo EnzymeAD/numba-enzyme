@@ -14,7 +14,7 @@ from numba_enzyme.build import build
 from numba_enzyme.driver import synthesise
 from numba_enzyme.lowering import lower
 from numba_enzyme.runtime import load
-from numba_enzyme.types import Array1D, Float64
+from numba_enzyme.types import Array1D, Float32, Float64
 
 
 def f1(x: Float64) -> Float64:
@@ -39,6 +39,14 @@ def f3(x: Float64, y: Float64, z: Float64) -> Float64:
 
 def f3_grad(x, y, z):
     return (y, x + z, y + math.exp(z))
+
+
+def f_tuple(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x * x + y
+
+
+def f_tuple32(x: Float32, y: Float32) -> tuple[Float32, Float32]:
+    return x * y, x + y
 
 
 @pytest.fixture(autouse=True)
@@ -83,17 +91,18 @@ def farr_grad(x):
     return 2 * x
 
 
-def test_synthesise_array_grad_signature():
+def test_synthesise_array_vjp_signature():
     """
     IR-shape check, before ever running Enzyme: a single array argument
-    (no scalar args) means grad_<entry> has no packed `out` pointer at
+    (no scalar args) means vjp_<entry> has no scalar `dx_out` pointer at
     all -- there is nothing for __enzyme_autodiff to pack/return, since
     the array's gradient is instead accumulated in place into its own
     dedicated shadow-pointer parameter (x0_ddata).
     """
     drv = synthesise(lower(farr))
     signature = (
-        f'define void @"{drv.grad_symbol}"(double* %"x0_data", '
+        f'define void @"{drv.vjp_symbol}"(double* %"cotangent", '
+        'double* %"x0_data", '
         'double* %"x0_ddata", i64 %"x0_nitems", i64 %"x0_itemsize", '
         'i64 %"x0_shape0", i64 %"x0_strides0")'
     )
@@ -119,3 +128,82 @@ def test_grad_and_jvp_match_analytic_for_array_argument():
         seed[i] = 1.0
         got = diff.jvp((x,), (seed,))
         assert got == pytest.approx(farr_grad(x)[i], abs=1e-9)
+
+
+def test_tuple_output_forward_derivatives():
+    diff = load(build(f_tuple))
+    x, y = 1.3, 0.7
+
+    assert diff.n_outputs == 2
+    assert diff.jvp((x, y), (0.25, -0.5)) == pytest.approx(
+        (y * 0.25 + x * -0.5, 2 * x * 0.25 - 0.5), abs=1e-9
+    )
+    jacobian = diff.jacfwd(x, y)
+    assert jacobian[0] == pytest.approx((y, x), abs=1e-9)
+    assert jacobian[1] == pytest.approx((2 * x, 1.0), abs=1e-9)
+    assert diff.jvp((x, y), (1.0, 0.0)) == pytest.approx((y, 2 * x), abs=1e-9)
+    assert diff.jvp((x, y), (0.0, 1.0)) == pytest.approx((x, 1.0), abs=1e-9)
+
+
+def test_tuple_output_reverse_derivatives():
+    diff = load(build(f_tuple))
+    x, y = 1.3, 0.7
+
+    assert diff.vjp((x, y), (0.25, -0.5)) == pytest.approx(
+        (y * 0.25 - x, x * 0.25 - 0.5), abs=1e-9
+    )
+    jacobian = diff.jacrev(x, y)
+    assert jacobian[0] == pytest.approx((y, x), abs=1e-9)
+    assert jacobian[1] == pytest.approx((2 * x, 1.0), abs=1e-9)
+    assert diff.vjp((x, y), (1.0, 0.0)) == pytest.approx((y, x), abs=1e-9)
+    assert diff.vjp((x, y), (0.0, 1.0)) == pytest.approx((2 * x, 1.0), abs=1e-9)
+
+
+def test_float32_tuple_output_uses_float32_runtime_abi():
+    diff = load(build(f_tuple32))
+    jacobian = diff.jacfwd(1.25, 0.75)
+    assert jacobian[0] == pytest.approx((0.75, 1.25), abs=1e-6)
+    assert jacobian[1] == pytest.approx((1.0, 1.0), abs=1e-6)
+    reverse = diff.jacrev(1.25, 0.75)
+    assert reverse[0] == pytest.approx((0.75, 1.25), abs=1e-6)
+    assert reverse[1] == pytest.approx((1.0, 1.0), abs=1e-6)
+
+
+def farr_tuple(x: Array1D(Float64)) -> tuple[Float64, Float64]:
+    s = 0.0
+    p = 1.0
+    for i in range(x.shape[0]):
+        s += x[i]
+        p *= x[i]
+    return s, p
+
+
+def test_tuple_output_jvp_for_array_argument():
+    diff = load(build(farr_tuple))
+    x = np.array([1.0, 2.0, 3.0])
+
+    for i in range(len(x)):
+        seed = np.zeros_like(x)
+        seed[i] = 1.0
+        got = diff.jvp((x,), (seed,))
+        assert got == pytest.approx((1.0, np.prod(x) / x[i]), abs=1e-9)
+
+
+def test_tuple_output_vjp_for_array_argument():
+    diff = load(build(farr_tuple))
+    x = np.array([1.0, 2.0, 3.0])
+
+    (by_sum,) = diff.vjp((x,), (1.0, 0.0))
+    assert by_sum == pytest.approx(np.ones_like(x), abs=1e-9)
+    (by_product,) = diff.vjp((x,), (0.0, 1.0))
+    assert by_product == pytest.approx(np.prod(x) / x, abs=1e-9)
+
+
+def test_jacobians_reject_array_arguments():
+    diff = load(build(farr))
+    x = np.array([1.0, 2.0, 3.0])
+
+    with pytest.raises(TypeError, match="does not support array arguments"):
+        diff.jacfwd(x)
+    with pytest.raises(TypeError, match="does not support array arguments"):
+        diff.jacrev(x)

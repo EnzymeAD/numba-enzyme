@@ -24,7 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #     cmake/build-essential/git/patchelf (patchelf is required by
 #     auditwheel repair -- confirmed during the manual spike it is NOT
 #     installed by default) and CPython's own build dependencies
-#     (building 3.11/3.12/3.13 from source below, since trixie's apt
+#     (building 3.10/3.11/3.12/3.13 from source below, since trixie's apt
 #     only ships 3.13 and cibuildwheel's custom-image contract requires
 #     every target version pre-installed under /opt/python/, matching
 #     the official manylinux image convention). ---
@@ -75,6 +75,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #     isn't something to bet on. `build` is the default build_frontend
 #     cibuildwheel invokes as `python -m build` to actually build the
 #     wheel -- confirmed missing in an earlier real run (ModuleNotFoundError). ---
+ARG PY310_VERSION=3.10.19
 ARG PY311_VERSION=3.11.15
 ARG PY312_VERSION=3.12.13
 ARG PY313_VERSION=3.13.14
@@ -100,7 +101,7 @@ RUN set -eux; \
     ln -sf "python${minor}" "/opt/python/${tag}/bin/python"
 
 RUN set -eux; \
-    for spec in "cp311-cp311:${PY311_VERSION}" "cp312-cp312:${PY312_VERSION}" "cp313-cp313:${PY313_VERSION}"; do \
+    for spec in "cp310-cp310:${PY310_VERSION}" "cp311-cp311:${PY311_VERSION}" "cp312-cp312:${PY312_VERSION}" "cp313-cp313:${PY313_VERSION}"; do \
         tag="${spec%%:*}"; version="${spec##*:}"; minor="${version%.*}"; \
         curl -fsSL "https://www.python.org/ftp/python/${version}/Python-${version}.tar.xz" -o /tmp/python.tar.xz; \
         mkdir -p /tmp/build && tar -xf /tmp/python.tar.xz -C /tmp/build; \

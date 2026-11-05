@@ -1,4 +1,5 @@
 .venv/
+.dev-toolchain/
 __pycache__/
 *.pyc
 enzyme-src/
@@ -9,10 +10,13 @@ enzyme-build/
 .ruff_cache/
 bk/
 
-# _vendor/ is populated at wheel-build time (see packaging/), never
-# committed as a matter of course -- but a blanket `*.so` above would
-# also make sdist-based build frontends silently drop the Enzyme
-# plugin from the wheel if it's ever present there. Un-ignore
-# explicitly rather than relying on which build frontend gets used.
-!src/numba_enzyme/_vendor/
-!src/numba_enzyme/_vendor/**
+# _vendor/ is the LLVM 15 + Enzyme toolchain, 237 MB staged at wheel-build
+# time and never committed. It used to be un-ignored, so that the blanket
+# `*.so` above could not make an sdist-based frontend silently ship a wheel
+# with no Enzyme plugin. hatch_build.py closed that hole from the other end:
+# it force-includes every _vendor/ file, which bypasses VCS ignore rules
+# entirely, and restages the toolchain from the released PyPI wheel whenever
+# the directory is missing -- so a wheel built from an sdist that excludes
+# _vendor/ still comes out complete. Ignoring it keeps `git status` readable
+# and the 237 MB un-committable.
+src/numba_enzyme/_vendor/
