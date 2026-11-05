@@ -12,13 +12,13 @@ jobs:
     name: Build wheel - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     container:
-      image: ${{ (contains(matrix.os, 'linux') && 'ghcr.io/enzymead/reactant-docker-images_22.04@sha256:3a4edb524a77b28cffdb9589fa23d0e4a43fec7da85f531e92ff6803fd62106f') || '' }}
+      image: ${{ (contains(matrix.os, 'ubuntu') && 'ghcr.io/enzymead/reactant-docker-images_22.04@sha256:3a4edb524a77b28cffdb9589fa23d0e4a43fec7da85f531e92ff6803fd62106f') || '' }}
     strategy:
       fail-fast: true
       matrix:
         os:
-          - linux-x86-n4-32
-          - linux-arm64-c4a-32
+          - ubuntu-latest
+          - ubuntu-24.04-arm
           - macOS-latest
     timeout-minutes: 240
     env:
@@ -36,7 +36,7 @@ jobs:
             BAZEL_FLAGS="${BAZEL_FLAGS} --repo_env=CC=$(command -v clang)"
           fi
           if [ "${{ runner.os }}" = "Linux" ]; then
-            BAZEL_FLAGS="${BAZEL_FLAGS} --config=public_cache_push"
+            BAZEL_FLAGS="${BAZEL_FLAGS} --config=public_cache"
           fi
           if [ "${{ runner.os }}" = "macOS" ]; then
             BAZEL_FLAGS="${BAZEL_FLAGS} --cxxopt=-Wno-nullability-completeness --host_cxxopt=-Wno-nullability-completeness"
@@ -49,10 +49,9 @@ jobs:
         name: Set up Bazel
         with:
           bazelisk-cache: true
-          disk-cache: ${{ runner.os == 'macOS' && format('wheel-{0}-{1}', github.workflow, matrix.os) || false }}
-          restore-keys: ${{ runner.os == 'macOS' && format('wheel-{0}-', github.workflow) || false }}
+          disk-cache: ${{ format('wheel-{0}-{1}', github.workflow, matrix.os) }}
+          cache-save: always
           repository-cache: true
-          save-always: true
           bazelisk-version: 1.x
 
       - name: Sync version from git tag
@@ -82,22 +81,16 @@ jobs:
           path: wheelhouse/*.whl
 
   smoke-test-wheels:
-    name: Smoke test wheel - ${{ matrix.os }} - Python ${{ matrix.python }}
+    name: Smoke test wheel - ${{ matrix.os }}
     needs: build-wheels
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os:
-          - linux-x86-n4-32
-          - linux-arm64-c4a-32
+          - ubuntu-latest
+          - ubuntu-24.04-arm
           - macOS-latest
-        python:
-          - "3.11"
-          - "3.12"
-          - "3.13"
-          - "3.14"
-          - "3.15"
     steps:
       - uses: actions/checkout@v4
 
@@ -108,17 +101,23 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
-      - name: Install wheel into clean Python ${{ matrix.python }} venv and run smoke + pytest
+      - name: Install wheel into clean Python 3.11-3.15 venvs and run smoke + pytest
         shell: bash
         run: |
+          set -euo pipefail
           WHEEL="$(pwd)/$(ls wheelhouse/numba_enzyme-*.whl)"
           SMOKE_SCRIPT="$(pwd)/packaging/smoke_test.py"
           cp -r tests /tmp/smoke-tests
-          uv venv --python "${{ matrix.python }}" /tmp/smoke-venv
-          uv pip install --python /tmp/smoke-venv/bin/python "${WHEEL}" pytest numpy
           cd /tmp
-          /tmp/smoke-venv/bin/python "${SMOKE_SCRIPT}"
-          /tmp/smoke-venv/bin/pytest -v /tmp/smoke-tests -k "not test_import"
+          for py in 3.11 3.12 3.13 3.14 3.15; do
+            echo "=== Smoke testing wheel on Python ${py} ==="
+            VENV="/tmp/smoke-venv-${py}"
+            uv venv --python "${py}" "${VENV}"
+            uv pip install --python "${VENV}/bin/python" "${WHEEL}" pytest numpy
+            "${VENV}/bin/python" "${SMOKE_SCRIPT}"
+            "${VENV}/bin/pytest" -v /tmp/smoke-tests -k "not test_import"
+            rm -rf "${VENV}"
+          done
 
   publish-testpypi:
     name: Publish to TestPyPI

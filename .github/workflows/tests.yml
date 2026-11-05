@@ -34,7 +34,7 @@ jobs:
         run: uv run pre-commit run --all-files
 
   test:
-    name: Test - ${{ matrix.os }} - Python ${{ matrix.python }}
+    name: Test - ${{ matrix.os }}
     needs: [detect-changes]
     if: |
       always() &&
@@ -42,23 +42,15 @@ jobs:
        needs.detect-changes.outputs.tests-relevant == 'true')
     runs-on: ${{ matrix.os }}
     container:
-      image: ${{ (contains(matrix.os, 'linux') && 'ghcr.io/enzymead/reactant-docker-images_22.04@sha256:3a4edb524a77b28cffdb9589fa23d0e4a43fec7da85f531e92ff6803fd62106f') || '' }}
+      image: ${{ (contains(matrix.os, 'ubuntu') && 'ghcr.io/enzymead/reactant-docker-images_22.04@sha256:3a4edb524a77b28cffdb9589fa23d0e4a43fec7da85f531e92ff6803fd62106f') || '' }}
     strategy:
       fail-fast: false
       matrix:
         os:
-          - linux-x86-n4-32
-          - linux-arm64-c4a-32
+          - ubuntu-latest
+          - ubuntu-24.04-arm
           - macOS-latest
-        python:
-          - "3.11"
-          - "3.12"
-          - "3.13"
-          - "3.14"
-          - "3.15"
     timeout-minutes: 180
-    env:
-      HERMETIC_PYTHON_VERSION: ${{ matrix.python }}
     steps:
       - name: Set BAZEL_FLAGS
         shell: bash
@@ -72,11 +64,7 @@ jobs:
             BAZEL_FLAGS="${BAZEL_FLAGS} --repo_env=CC=$(command -v clang)"
           fi
           if [ "${{ runner.os }}" = "Linux" ]; then
-            if [ "${{ github.event_name }}" != "pull_request" ] || [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
-              BAZEL_FLAGS="${BAZEL_FLAGS} --config=public_cache_push"
-            else
-              BAZEL_FLAGS="${BAZEL_FLAGS} --config=public_cache"
-            fi
+            BAZEL_FLAGS="${BAZEL_FLAGS} --config=public_cache"
           fi
           if [ "${{ runner.os }}" = "macOS" ]; then
             BAZEL_FLAGS="${BAZEL_FLAGS} --cxxopt=-Wno-nullability-completeness --host_cxxopt=-Wno-nullability-completeness"
@@ -89,21 +77,26 @@ jobs:
         name: Set up Bazel
         with:
           bazelisk-cache: true
-          disk-cache: ${{ runner.os == 'macOS' && format('test-{0}-{1}-{2}', github.workflow, matrix.os, matrix.python) || false }}
-          restore-keys: ${{ runner.os == 'macOS' && format('test-{0}-{1}-', github.workflow, matrix.os) || false }}
+          disk-cache: ${{ format('test-{0}-{1}', github.workflow, matrix.os) }}
+          cache-save: always
           repository-cache: true
           bazelisk-version: 1.x
 
-      - name: Run Bazel test suite
+      - name: Run Bazel test suite (Python 3.11 - 3.15)
+        shell: bash
         run: |
-          bazel test $BAZEL_FLAGS \
-            --color=yes \
-            --test_output=errors \
-            --experimental_ui_max_stdouterr_bytes=-1 \
-            --test_verbose_timeout_warnings \
-            //tests:python_tests
+          set -euo pipefail
+          for py in 3.11 3.12 3.13 3.14 3.15; do
+            echo "=== Testing with HERMETIC_PYTHON_VERSION=${py} ==="
+            HERMETIC_PYTHON_VERSION="${py}" bazel test $BAZEL_FLAGS \
+              --color=yes \
+              --test_output=errors \
+              --experimental_ui_max_stdouterr_bytes=-1 \
+              --test_verbose_timeout_warnings \
+              //tests:python_tests
+          done
 
       - name: Build wheel
-        if: matrix.python == '3.11'
+        shell: bash
         run: |
-          bazel build $BAZEL_FLAGS --color=yes //:wheel
+          HERMETIC_PYTHON_VERSION="3.11" bazel build $BAZEL_FLAGS --color=yes //:wheel

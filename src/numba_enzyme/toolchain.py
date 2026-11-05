@@ -23,9 +23,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-_PACKAGE_DIR = Path(__file__).resolve().parent
+_PACKAGE_DIR = Path(os.path.abspath(__file__)).parent
 _VENDOR_DIR = _PACKAGE_DIR / "_vendor"
-_REPO_ROOT = _PACKAGE_DIR.parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _LIB_NAMES = ("libNumbaEnzyme.so", "libNumbaEnzyme.dylib")
 _LIB_PATH_ENV_VAR = "NUMBA_ENZYME_LIB_PATH"
